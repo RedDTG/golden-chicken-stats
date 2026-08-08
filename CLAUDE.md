@@ -35,3 +35,7 @@ Everything lives in `bot.py` and runs as one process with no persistence besides
 4. **Sheet append**: each parsed result becomes one row (`timestamp, player, result, gain, strength, message_id`) appended with `append_row(..., value_input_option="USER_ENTERED")`.
 
 Because parsing is purely regex/string-matching against UnbelievaBoat's embed text, any wording change in that bot's cockfight messages requires updating `WIN_GAIN_RE`, `PERCENT_RE`, or the `"lost the fight"`/`"won the fight"` checks in `parse_cockfight_embed`.
+
+## Backfill
+
+`backfill.py` is a one-off script (run manually with `python backfill.py`) that reuses `bot.py`'s config, sheet client, and `parse_cockfight_embed` to rescan a channel's full history: it corrects the Resultat/Gain/Probabilite columns of rows already logged (matched by Message ID) and appends any cockfight results that were never logged. Useful after a parsing bug fix or after the bot was offline for a while. It needs the "Read Message History" permission on the watched channel(s).
