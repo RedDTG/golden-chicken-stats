@@ -305,7 +305,15 @@ _backfill_lock = asyncio.Lock()
 @bot.event
 async def on_ready():
     ensure_header()
-    await bot.tree.sync()
+    try:
+        await bot.tree.sync()
+        for guild in bot.guilds:
+            bot.tree.copy_global_to(guild=guild)
+            await bot.tree.sync(guild=guild)
+    except discord.HTTPException:
+        log.exception("Echec de la synchronisation des commandes slash")
+    else:
+        log.info("Commandes slash synchronisees (globalement + sur %d serveur(s))", len(bot.guilds))
     if WATCH_CHANNEL_ID:
         log.info("Connecte en tant que %s - ecoute du salon %s", bot.user, WATCH_CHANNEL_ID)
     else:
