@@ -7,7 +7,7 @@ Bot Discord qui surveille les résultats de cockfight d'UnbelievaBoat et les jou
 - **Journalisation en temps réel** : chaque victoire/défaite de cockfight postée par UnbelievaBoat est parsée et ajoutée comme ligne dans la feuille `Cockfights` (joueur, résultat, gain, probabilité, horodatage, serveur).
 - **`/backfill`** (réservée aux administrateurs) : rescanne tout l'historique du salon surveillé (et de ses fils, actifs et archivés) pour corriger les lignes déjà loguées et ajouter celles qui manquent. Utile après une correction de bug de parsing ou une coupure du bot.
 - **`/stats`** : affiche un embed avec les statistiques du serveur (combats, victoires, défaites, meilleur/pire winrate, poulet obtenu à la plus haute probabilité).
-- **Feuille `Overview`** : une ligne par joueur (+ une ligne `Total`) avec Total / Défaites / Victoires / Ratio (winrate) / Meilleur % / Rentabilité, recalculée automatiquement à chaque combat logué et après chaque backfill.
+- **Feuille `Overview`** : une ligne par joueur (+ une ligne `Total`) avec Total / Défaites / Victoires / Winrate / Meilleur poulet / Rentabilité, recalculée automatiquement à chaque combat logué et après chaque backfill.
 
 ## Prérequis
 
