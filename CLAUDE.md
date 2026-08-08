@@ -19,6 +19,7 @@ Required environment variables (see `.env.example`, loaded via `python-dotenv`):
 - `WATCH_CHANNEL_ID` (optional) — if set, the only channel the bot listens to; if empty/unset, the bot listens across every channel it can see.
 - `UNBELIEVABOAT_ID` (optional) — if set, only embeds authored by this bot ID are parsed; otherwise any bot message in the channel is considered.
 - `GOOGLE_CREDENTIALS_FILE` (default `credentials.json`) — Google service-account key file, not committed (gitignored).
+- `GOOGLE_CREDENTIALS_JSON` (optional) — the service-account key as a raw JSON string, used instead of `GOOGLE_CREDENTIALS_FILE` when set (takes priority). Useful in deployments (e.g. Coolify) where providing a file is inconvenient.
 - `GOOGLE_SHEET_ID` — target spreadsheet ID (from its URL).
 - `GOOGLE_SHEET_TAB` (default `Cockfights`) — worksheet/tab name; must already exist in the sheet.
 
