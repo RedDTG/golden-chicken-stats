@@ -136,13 +136,17 @@ async def find_bet_amount(message: discord.Message, player: str) -> str:
     async for prev in message.channel.history(limit=10, before=message):
         if prev.author.bot:
             continue
-        match = BET_RE.search(prev.content)
-        if not match:
+        if not prev.content.lower().startswith("+cf"):
             continue
         names = {prev.author.name.lower(), prev.author.display_name.lower()}
         if player not in names:
             continue
-        return match.group(1).replace(",", "")
+        # Le +cf le plus recent du joueur est forcement celui qui a produit
+        # ce resultat: on s'arrete la meme s'il n'a pas de montant chiffre
+        # (ex. "+cf all"), plutot que de continuer vers un +cf plus ancien
+        # et sans rapport (ex. une commande precedente ratee).
+        match = BET_RE.search(prev.content)
+        return match.group(1).replace(",", "") if match else ""
     return ""
 
 
