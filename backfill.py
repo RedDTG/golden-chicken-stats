@@ -52,6 +52,7 @@ async def backfill() -> None:
 
             updates = []
             new_rows = []
+            last_win_percent: dict[str, str] = {}
 
             for channel in channels:
                 log.info("Analyse du salon #%s...", channel.name)
@@ -70,10 +71,15 @@ async def backfill() -> None:
 
                         player, result, gain, strength = parsed
 
+                        if result == "Victoire" and strength:
+                            last_win_percent[player] = strength
+
                         if result == "Defaite":
                             bet = await find_bet_amount(message, player)
                             if bet:
                                 gain = f"-{bet}"
+                            if not strength and player in last_win_percent:
+                                strength = str(int(last_win_percent[player]) + 1)
 
                         msg_id = str(message.id)
 

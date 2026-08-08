@@ -61,6 +61,14 @@ def parse_cockfight_embed(embed: discord.Embed):
     return None
 
 
+def last_win_strength(player: str) -> str:
+    values = _sheet.get_all_values()
+    for row in reversed(values[1:]):
+        if len(row) > 4 and row[1] == player and row[2] == "Victoire" and row[4].isdigit():
+            return str(int(row[4]) + 1)
+    return ""
+
+
 async def find_bet_amount(message: discord.Message, player: str) -> str:
     player = player.lower()
     async for prev in message.channel.history(limit=10, before=message):
@@ -112,6 +120,8 @@ async def on_message(message: discord.Message):
             bet = await find_bet_amount(message, player)
             if bet:
                 gain = f"-{bet}"
+            if not strength:
+                strength = last_win_strength(player)
 
         timestamp = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
