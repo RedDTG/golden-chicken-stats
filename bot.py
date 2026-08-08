@@ -46,20 +46,15 @@ def parse_cockfight_embed(embed: discord.Embed):
     description = embed.description or ""
     player = embed.author.name if embed.author and embed.author.name else "Inconnu"
 
+    percent_match = PERCENT_RE.search(description)
+    strength = percent_match.group(1) if percent_match else ""
+
     if "lost the fight" in description.lower():
-        return player, "Defaite", "", ""
+        return player, "Defaite", "", strength
 
     if "won the fight" in description.lower():
         gain_match = WIN_GAIN_RE.search(description)
         gain = gain_match.group(1).replace(",", "") if gain_match else ""
-
-        strength = ""
-        for field in embed.fields:
-            if "chance of winning" in field.name.lower():
-                percent_match = PERCENT_RE.search(field.value)
-                strength = percent_match.group(1) if percent_match else ""
-                break
-
         return player, "Victoire", gain, strength
 
     return None
