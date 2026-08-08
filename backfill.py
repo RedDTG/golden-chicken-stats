@@ -14,6 +14,7 @@ from bot import (
     WATCH_CHANNEL_ID,
     _sheet,
     ensure_header,
+    find_bet_amount,
     intents,
     log,
     parse_cockfight_embed,
@@ -68,6 +69,12 @@ async def backfill() -> None:
                             continue
 
                         player, result, gain, strength = parsed
+
+                        if result == "Defaite":
+                            bet = await find_bet_amount(message, player)
+                            if bet:
+                                gain = f"-{bet}"
+
                         msg_id = str(message.id)
 
                         if msg_id in existing:

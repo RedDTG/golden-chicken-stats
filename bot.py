@@ -25,6 +25,7 @@ log = logging.getLogger("cockfight-tracker")
 
 WIN_GAIN_RE = re.compile(r"([\d,]+)\s*richer", re.IGNORECASE)
 PERCENT_RE = re.compile(r"(\d+)\s*%")
+BET_RE = re.compile(r"\+cf\s+([\d,]+)", re.IGNORECASE)
 
 HEADER = ["Horodatage", "Joueur", "Resultat", "Gain", "Probabilite (%)", "Message ID"]
 
@@ -60,6 +61,21 @@ def parse_cockfight_embed(embed: discord.Embed):
     return None
 
 
+async def find_bet_amount(message: discord.Message, player: str) -> str:
+    player = player.lower()
+    async for prev in message.channel.history(limit=10, before=message):
+        if prev.author.bot:
+            continue
+        match = BET_RE.search(prev.content)
+        if not match:
+            continue
+        names = {prev.author.name.lower(), prev.author.display_name.lower()}
+        if player not in names:
+            continue
+        return match.group(1).replace(",", "")
+    return ""
+
+
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -91,6 +107,12 @@ async def on_message(message: discord.Message):
             continue
 
         player, result, gain, strength = parsed
+
+        if result == "Defaite":
+            bet = await find_bet_amount(message, player)
+            if bet:
+                gain = f"-{bet}"
+
         timestamp = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
         _sheet.append_row(
