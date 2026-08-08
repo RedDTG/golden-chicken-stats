@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+from collections import Counter
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -207,6 +208,41 @@ async def run_backfill(client: discord.Client) -> tuple[int, int]:
     return len(corrected_rows), len(new_rows)
 
 
+def build_stats_embed(server: str) -> discord.Embed:
+    rows = [row for row in _sheet.get_all_values()[1:] if len(row) > 6 and row[6] == server]
+    wins = [row for row in rows if row[2] == "Victoire"]
+    losses = [row for row in rows if row[2] == "Defaite"]
+
+    top_winner = Counter(row[1] for row in wins).most_common(1)
+    top_loser = Counter(row[1] for row in losses).most_common(1)
+    highest_prob_win = max(
+        (row for row in wins if len(row) > 4 and row[4].isdigit()),
+        key=lambda row: int(row[4]),
+        default=None,
+    )
+
+    embed = discord.Embed(title=f"Statistiques cockfight - {server}", color=discord.Color.gold())
+    embed.add_field(name="Combats", value=str(len(rows)), inline=True)
+    embed.add_field(name="Victoires", value=str(len(wins)), inline=True)
+    embed.add_field(name="Defaites", value=str(len(losses)), inline=True)
+    embed.add_field(
+        name="Plus de victoires",
+        value=f"{top_winner[0][0]} ({top_winner[0][1]})" if top_winner else "Aucune",
+        inline=False,
+    )
+    embed.add_field(
+        name="Plus de defaites",
+        value=f"{top_loser[0][0]} ({top_loser[0][1]})" if top_loser else "Aucune",
+        inline=False,
+    )
+    embed.add_field(
+        name="Poulet a la plus haute probabilite",
+        value=f"{highest_prob_win[1]} ({highest_prob_win[4]}%)" if highest_prob_win else "Aucun",
+        inline=False,
+    )
+    return embed
+
+
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -249,6 +285,17 @@ async def backfill_command_error(interaction: discord.Interaction, error: app_co
         await interaction.response.send_message("Tu dois etre administrateur pour lancer un backfill.", ephemeral=True)
     else:
         raise error
+
+
+@bot.tree.command(name="stats", description="Affiche les statistiques cockfight du serveur")
+async def stats_command(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("Cette commande doit etre utilisee dans un serveur.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    embed = build_stats_embed(interaction.guild.name)
+    await interaction.followup.send(embed=embed)
 
 
 @bot.event
