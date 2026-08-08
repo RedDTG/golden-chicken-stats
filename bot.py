@@ -23,7 +23,7 @@ GOOGLE_SHEET_TAB = os.environ.get("GOOGLE_SHEET_TAB", "Cockfights")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("cockfight-tracker")
 
-WIN_GAIN_RE = re.compile(r"made you\D*([\d,]+)\D*richer", re.IGNORECASE)
+WIN_GAIN_RE = re.compile(r"([\d,]+)\s*richer", re.IGNORECASE)
 PERCENT_RE = re.compile(r"(\d+)\s*%")
 
 HEADER = ["Horodatage", "Joueur", "Resultat", "Gain", "Probabilite (%)", "Message ID"]
@@ -46,7 +46,7 @@ def parse_cockfight_embed(embed: discord.Embed):
     description = embed.description or ""
     player = embed.author.name if embed.author and embed.author.name else "Inconnu"
 
-    percent_match = PERCENT_RE.search(description)
+    percent_match = PERCENT_RE.search(embed.footer.text or "")
     strength = percent_match.group(1) if percent_match else ""
 
     if "lost the fight" in description.lower():
