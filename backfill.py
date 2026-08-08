@@ -82,13 +82,15 @@ async def backfill() -> None:
                                 strength = str(int(last_win_percent[player]) + 1) if player in last_win_percent else "50"
 
                         msg_id = str(message.id)
+                        server = message.guild.name if message.guild else ""
 
                         if msg_id in existing:
                             row = existing[msg_id]
                             updates.append({"range": f"C{row}:E{row}", "values": [[result, gain, strength]]})
+                            updates.append({"range": f"G{row}", "values": [[server]]})
                         else:
                             timestamp = message.created_at.astimezone().isoformat(timespec="seconds")
-                            new_rows.append([timestamp, player, result, gain, strength, msg_id])
+                            new_rows.append([timestamp, player, result, gain, strength, msg_id, server])
 
             if updates:
                 _sheet.batch_update(updates, value_input_option="USER_ENTERED")

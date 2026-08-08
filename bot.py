@@ -27,7 +27,7 @@ WIN_GAIN_RE = re.compile(r"([\d,]+)\s*richer", re.IGNORECASE)
 PERCENT_RE = re.compile(r"(\d+)\s*%")
 BET_RE = re.compile(r"\+cf\s+([\d,]+)", re.IGNORECASE)
 
-HEADER = ["Horodatage", "Joueur", "Resultat", "Gain", "Probabilite (%)", "Message ID"]
+HEADER = ["Horodatage", "Joueur", "Resultat", "Gain", "Probabilite (%)", "Message ID", "Serveur"]
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 if GOOGLE_CREDENTIALS_JSON:
@@ -124,9 +124,10 @@ async def on_message(message: discord.Message):
                 strength = last_win_strength(player)
 
         timestamp = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+        server = message.guild.name if message.guild else ""
 
         _sheet.append_row(
-            [timestamp, player, result, gain, strength, str(message.id)],
+            [timestamp, player, result, gain, strength, str(message.id), server],
             value_input_option="USER_ENTERED",
         )
         log.info("%s - %s - gain=%s - force=%s%%", player, result, gain, strength)
