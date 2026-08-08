@@ -78,8 +78,8 @@ async def backfill() -> None:
                             bet = await find_bet_amount(message, player)
                             if bet:
                                 gain = f"-{bet}"
-                            if not strength and player in last_win_percent:
-                                strength = str(int(last_win_percent[player]) + 1)
+                            if not strength:
+                                strength = str(int(last_win_percent[player]) + 1) if player in last_win_percent else "50"
 
                         msg_id = str(message.id)
 

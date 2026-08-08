@@ -66,7 +66,7 @@ def last_win_strength(player: str) -> str:
     for row in reversed(values[1:]):
         if len(row) > 4 and row[1] == player and row[2] == "Victoire" and row[4].isdigit():
             return str(int(row[4]) + 1)
-    return ""
+    return "50"
 
 
 async def find_bet_amount(message: discord.Message, player: str) -> str:
