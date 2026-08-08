@@ -266,8 +266,12 @@ def build_stats_embed(server: str) -> discord.Embed:
     wins = [row for row in rows if row[2] == "Victoire"]
     losses = [row for row in rows if row[2] == "Defaite"]
 
-    top_winner = Counter(row[1] for row in wins).most_common(1)
-    top_loser = Counter(row[1] for row in losses).most_common(1)
+    total_counts = Counter(row[1] for row in rows)
+    win_counts = Counter(row[1] for row in wins)
+    winrates = {player: win_counts[player] / total * 100 for player, total in total_counts.items()}
+    best_winrate = max(winrates.items(), key=lambda item: item[1], default=None)
+    worst_winrate = min(winrates.items(), key=lambda item: item[1], default=None)
+
     highest_prob_win = max(
         (row for row in wins if len(row) > 4 and row[4].isdigit()),
         key=lambda row: int(row[4]),
@@ -279,13 +283,13 @@ def build_stats_embed(server: str) -> discord.Embed:
     embed.add_field(name="Victoires", value=str(len(wins)), inline=True)
     embed.add_field(name="Defaites", value=str(len(losses)), inline=True)
     embed.add_field(
-        name="Plus de victoires",
-        value=f"{top_winner[0][0]} ({top_winner[0][1]})" if top_winner else "Aucune",
+        name="Meilleur winrate",
+        value=f"{best_winrate[0]} ({best_winrate[1]:.0f}%)" if best_winrate else "Aucune",
         inline=False,
     )
     embed.add_field(
-        name="Plus de defaites",
-        value=f"{top_loser[0][0]} ({top_loser[0][1]})" if top_loser else "Aucune",
+        name="Pire winrate",
+        value=f"{worst_winrate[0]} ({worst_winrate[1]:.0f}%)" if worst_winrate else "Aucune",
         inline=False,
     )
     embed.add_field(
@@ -302,22 +306,37 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 _backfill_lock = asyncio.Lock()
 
 
+async def _sync_guild_commands(guild: discord.Guild) -> None:
+    bot.tree.copy_global_to(guild=guild)
+    await bot.tree.sync(guild=guild)
+
+
 @bot.event
 async def on_ready():
     ensure_header()
     try:
-        await bot.tree.sync()
+        # On synchronise uniquement par serveur (quasi instantane) : un sync
+        # global met jusqu'a une heure a apparaitre, et le combiner avec un
+        # sync par serveur fait apparaitre chaque commande en double dans le
+        # client Discord. bulk_upsert_global_commands([]) efface les
+        # commandes globales laissees par un ancien deploiement, sans passer
+        # par tree.sync() qui viderait aussi la source utilisee par copy_global_to.
+        await bot.http.bulk_upsert_global_commands(bot.application_id, [])
         for guild in bot.guilds:
-            bot.tree.copy_global_to(guild=guild)
-            await bot.tree.sync(guild=guild)
+            await _sync_guild_commands(guild)
     except discord.HTTPException:
         log.exception("Echec de la synchronisation des commandes slash")
     else:
-        log.info("Commandes slash synchronisees (globalement + sur %d serveur(s))", len(bot.guilds))
+        log.info("Commandes slash synchronisees sur %d serveur(s)", len(bot.guilds))
     if WATCH_CHANNEL_ID:
         log.info("Connecte en tant que %s - ecoute du salon %s", bot.user, WATCH_CHANNEL_ID)
     else:
         log.info("Connecte en tant que %s - ecoute de tous les salons", bot.user)
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild) -> None:
+    await _sync_guild_commands(guild)
 
 
 @bot.tree.command(name="backfill", description="Rescanne l'historique (et les fils) pour corriger/ajouter les combats manques")
