@@ -34,7 +34,7 @@ PERCENT_RE = re.compile(r"(\d+)\s*%")
 BET_RE = re.compile(r"\+cf\s+([\d,]+)", re.IGNORECASE)
 
 HEADER = ["Horodatage", "Joueur", "Resultat", "Gain", "Probabilite (%)", "Message ID", "Serveur"]
-OVERVIEW_HEADER = ["", "Total", "Defaites", "Victoires", "Ratio", "Meilleur %", "Rentabilite"]
+OVERVIEW_HEADER = ["Utilisateur", "Total", "Defaites", "Victoires", "Ratio", "Meilleur %", "Rentabilite"]
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 if GOOGLE_CREDENTIALS_JSON:
