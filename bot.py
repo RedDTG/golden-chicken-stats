@@ -24,6 +24,7 @@ GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 GOOGLE_CREDENTIALS_FILE = os.environ.get("GOOGLE_CREDENTIALS_FILE", "credentials.json")
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 GOOGLE_SHEET_TAB = os.environ.get("GOOGLE_SHEET_TAB", "Cockfights")
+OVERVIEW_SHEET_TAB = os.environ.get("OVERVIEW_SHEET_TAB", "Overview")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("cockfight-tracker")
@@ -33,6 +34,7 @@ PERCENT_RE = re.compile(r"(\d+)\s*%")
 BET_RE = re.compile(r"\+cf\s+([\d,]+)", re.IGNORECASE)
 
 HEADER = ["Horodatage", "Joueur", "Resultat", "Gain", "Probabilite (%)", "Message ID", "Serveur"]
+OVERVIEW_HEADER = ["", "Total", "Defaites", "Victoires", "Meilleur %", "Rentabilite"]
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 if GOOGLE_CREDENTIALS_JSON:
@@ -41,11 +43,14 @@ else:
     _creds = Credentials.from_service_account_file(GOOGLE_CREDENTIALS_FILE, scopes=SCOPES)
 _gc = gspread.authorize(_creds)
 _sheet = _gc.open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_TAB)
+_overview_sheet = _gc.open_by_key(GOOGLE_SHEET_ID).worksheet(OVERVIEW_SHEET_TAB)
 
 
 def ensure_header() -> None:
     if _sheet.row_values(1) != HEADER:
         _sheet.update("A1", [HEADER])
+    if _overview_sheet.row_values(1) != OVERVIEW_HEADER:
+        _overview_sheet.update("A1", [OVERVIEW_HEADER])
 
 
 def parse_cockfight_embed(embed: discord.Embed):
@@ -77,6 +82,51 @@ def last_win_strength(player: str) -> str:
         return "50"
     latest = max(wins, key=lambda row: datetime.fromisoformat(row[0]))
     return str(int(latest[4]) + 1)
+
+
+def update_overview() -> None:
+    """Recalcule la feuille Overview (une ligne par joueur + une ligne 'Total')
+    a partir de l'ensemble des lignes de la feuille principale."""
+    stats: dict[str, dict[str, int]] = {}
+
+    def entry(name: str) -> dict[str, int]:
+        return stats.setdefault(name, {"total": 0, "defeats": 0, "wins": 0, "best_percent": 0, "profit": 0})
+
+    for row in _sheet.get_all_values()[1:]:
+        if len(row) < 4:
+            continue
+        player, result, gain = row[1], row[2], row[3]
+
+        for target in (player, "Total"):
+            data = entry(target)
+            data["total"] += 1
+            if result == "Victoire":
+                data["wins"] += 1
+            elif result == "Defaite":
+                data["defeats"] += 1
+            if gain.lstrip("-").isdigit():
+                data["profit"] += int(gain)
+            if result == "Victoire" and len(row) > 4 and row[4].isdigit():
+                data["best_percent"] = max(data["best_percent"], int(row[4]))
+
+    existing = {
+        row[0]: i for i, row in enumerate(_overview_sheet.get_all_values(), start=1) if i > 1 and row and row[0]
+    }
+
+    updates = []
+    new_rows = []
+    for name in ["Total"] + sorted(p for p in stats if p != "Total"):
+        data = stats[name]
+        values = [data["total"], data["defeats"], data["wins"], data["best_percent"] or "", data["profit"]]
+        if name in existing:
+            updates.append({"range": f"B{existing[name]}:F{existing[name]}", "values": [values]})
+        else:
+            new_rows.append([name, *values])
+
+    if updates:
+        _overview_sheet.batch_update(updates, value_input_option="USER_ENTERED")
+    if new_rows:
+        _overview_sheet.append_rows(new_rows, value_input_option="USER_ENTERED")
 
 
 async def find_bet_amount(message: discord.Message, player: str) -> str:
@@ -205,6 +255,9 @@ async def run_backfill(client: discord.Client) -> tuple[int, int]:
     else:
         log.info("Aucune nouvelle ligne a ajouter.")
 
+    if updates or new_rows:
+        update_overview()
+
     return len(corrected_rows), len(new_rows)
 
 
@@ -330,6 +383,7 @@ async def on_message(message: discord.Message):
             [timestamp, player, result, gain, strength, str(message.id), server],
             value_input_option="USER_ENTERED",
         )
+        update_overview()
         log.info("%s - %s - gain=%s - force=%s%%", player, result, gain, strength)
 
 

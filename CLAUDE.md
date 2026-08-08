@@ -22,6 +22,7 @@ Required environment variables (see `.env.example`, loaded via `python-dotenv`):
 - `GOOGLE_CREDENTIALS_JSON` (optional) — the service-account key as a raw JSON string, used instead of `GOOGLE_CREDENTIALS_FILE` when set (takes priority). Useful in deployments (e.g. Coolify) where providing a file is inconvenient.
 - `GOOGLE_SHEET_ID` — target spreadsheet ID (from its URL).
 - `GOOGLE_SHEET_TAB` (default `Cockfights`) — worksheet/tab name; must already exist in the sheet.
+- `OVERVIEW_SHEET_TAB` (default `Overview`) — second worksheet/tab name for the per-player rollup kept up to date by `update_overview()`; must already exist in the sheet.
 - `TIMEZONE` (default `Europe/Paris`) — IANA zone name used to render the Horodatage column, via `zoneinfo`. Deliberately independent of the host machine's system timezone (a bare `.astimezone()` on a UTC-configured server/container silently produces `+00:00` timestamps instead of local time — this bit us once, see `tzdata` in `requirements.txt` for the portable data source).
 
 There is no test suite, linter, or build step in this repo currently.
@@ -51,3 +52,7 @@ Either way, `run_backfill()` rescans each watched channel plus all of its thread
 ## Stats
 
 `/stats` (open to anyone, no permission gate) builds a Discord embed from `build_stats_embed()`: it filters the sheet's rows to the invoking `interaction.guild.name` (matching the Serveur column — stats are per-server even though one sheet can hold rows from several guilds), then reports combat/win/loss counts, the player with the most wins and the player with the most losses (via `collections.Counter`), and the win with the single highest Probabilite value (and who scored it).
+
+## Overview sheet
+
+`update_overview()` keeps a second worksheet (`OVERVIEW_SHEET_TAB`, one row per player plus a `"Total"` aggregate row, columns `Total / Defaites / Victoires / Meilleur % / Rentabilite`) in sync with the main sheet: it re-derives per-player and global totals from every row on each call (games played, defeats, wins, the highest Probabilite among that player's wins, and Rentabilite = the sum of the Gain column, non-numeric/blank gains counting as 0), then matches existing Overview rows by exact string equality on column A — same convention as the Joueur column elsewhere — updating them in place and appending a new row for any player not yet present. Unlike `/stats`, this aggregates across every server in the sheet (the Overview layout has no Serveur split). It's called after every real-time log in `on_message` and once at the end of `run_backfill()` (not per-row during a backfill, to avoid redundant full-sheet recomputation), so it stays current automatically without a dedicated command. Note: because matching is exact-string, a player row must be spelled exactly like the Joueur value logged from `embed.author.name` (Discord username) to be picked up — a manually-typed row with a different spelling/casing won't be matched and a second row will be created instead.
