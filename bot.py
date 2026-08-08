@@ -63,10 +63,15 @@ def parse_cockfight_embed(embed: discord.Embed):
 
 def last_win_strength(player: str) -> str:
     values = _sheet.get_all_values()
-    for row in reversed(values[1:]):
-        if len(row) > 4 and row[1] == player and row[2] == "Victoire" and row[4].isdigit():
-            return str(int(row[4]) + 1)
-    return "50"
+    wins = [
+        row
+        for row in values[1:]
+        if len(row) > 4 and row[1] == player and row[2] == "Victoire" and row[4].isdigit() and row[0]
+    ]
+    if not wins:
+        return "50"
+    latest = max(wins, key=lambda row: datetime.fromisoformat(row[0]))
+    return str(int(latest[4]) + 1)
 
 
 async def find_bet_amount(message: discord.Message, player: str) -> str:

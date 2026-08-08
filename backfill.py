@@ -37,6 +37,26 @@ def _watched_channels(client: discord.Client) -> list[discord.TextChannel]:
     return channels
 
 
+async def _channel_group(channel: discord.TextChannel) -> list[discord.abc.Messageable]:
+    """Le salon lui-meme plus tous ses fils (actifs et archives, publics et prives),
+    car channel.history() ne descend pas dans les fils."""
+    group = [channel]
+
+    active = await channel.guild.active_threads()
+    group.extend(t for t in active if t.parent_id == channel.id)
+
+    try:
+        group.extend([t async for t in channel.archived_threads(limit=None)])
+    except discord.Forbidden:
+        pass
+    try:
+        group.extend([t async for t in channel.archived_threads(private=True, limit=None)])
+    except discord.Forbidden:
+        pass
+
+    return group
+
+
 async def backfill() -> None:
     client = discord.Client(intents=intents)
 
@@ -55,8 +75,17 @@ async def backfill() -> None:
             last_win_percent: dict[str, str] = {}
 
             for channel in channels:
-                log.info("Analyse du salon #%s...", channel.name)
-                async for message in channel.history(limit=None, oldest_first=True):
+                subchannels = await _channel_group(channel)
+                log.info(
+                    "Analyse du salon #%s (%d fil(s) inclus)...", channel.name, len(subchannels) - 1
+                )
+
+                messages = []
+                for sub in subchannels:
+                    messages.extend([m async for m in sub.history(limit=None, oldest_first=True)])
+                messages.sort(key=lambda m: m.id)
+
+                for message in messages:
                     if not message.author.bot:
                         continue
                     if UNBELIEVABOAT_ID and message.author.id != UNBELIEVABOAT_ID:
