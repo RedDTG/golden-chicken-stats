@@ -3,10 +3,12 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import discord
 import gspread
+from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
@@ -14,6 +16,7 @@ from google.oauth2.service_account import Credentials
 load_dotenv()
 
 DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
+TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Paris"))
 WATCH_CHANNEL_ID = int(os.environ["WATCH_CHANNEL_ID"]) if os.environ.get("WATCH_CHANNEL_ID") else None
 UNBELIEVABOAT_ID = int(os.environ.get("UNBELIEVABOAT_ID", "0") or 0)
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
@@ -178,14 +181,15 @@ async def run_backfill(client: discord.Client) -> tuple[int, int]:
 
                 msg_id = str(message.id)
                 server = message.guild.name if message.guild else ""
+                timestamp = message.created_at.astimezone(TIMEZONE).isoformat(timespec="seconds")
 
                 if msg_id in existing:
                     row = existing[msg_id]
                     corrected_rows.add(row)
+                    updates.append({"range": f"A{row}", "values": [[timestamp]]})
                     updates.append({"range": f"C{row}:E{row}", "values": [[result, gain, strength]]})
                     updates.append({"range": f"G{row}", "values": [[server]]})
                 else:
-                    timestamp = message.created_at.astimezone().isoformat(timespec="seconds")
                     new_rows.append([timestamp, player, result, gain, strength, msg_id, server])
 
     if updates:
@@ -212,43 +216,43 @@ _backfill_lock = asyncio.Lock()
 @bot.event
 async def on_ready():
     ensure_header()
+    await bot.tree.sync()
     if WATCH_CHANNEL_ID:
         log.info("Connecte en tant que %s - ecoute du salon %s", bot.user, WATCH_CHANNEL_ID)
     else:
         log.info("Connecte en tant que %s - ecoute de tous les salons", bot.user)
 
 
-@bot.command(name="backfill")
-@commands.has_permissions(administrator=True)
-async def backfill_command(ctx: commands.Context):
+@bot.tree.command(name="backfill", description="Rescanne l'historique (et les fils) pour corriger/ajouter les combats manques")
+@app_commands.checks.has_permissions(administrator=True)
+async def backfill_command(interaction: discord.Interaction):
     if _backfill_lock.locked():
-        await ctx.send("Un backfill est deja en cours.")
+        await interaction.response.send_message("Un backfill est deja en cours.", ephemeral=True)
         return
 
+    await interaction.response.defer()
     async with _backfill_lock:
-        await ctx.send("Backfill en cours, ca peut prendre un moment...")
+        await interaction.followup.send("Backfill en cours, ca peut prendre un moment...")
         try:
             corrected, added = await run_backfill(bot)
         except Exception:
             log.exception("Erreur pendant le backfill")
-            await ctx.send("Le backfill a echoue, voir les logs.")
+            await interaction.followup.send("Le backfill a echoue, voir les logs.")
             return
 
-        await ctx.send(f"Backfill termine : {corrected} ligne(s) corrigee(s), {added} ligne(s) ajoutee(s).")
+        await interaction.followup.send(f"Backfill termine : {corrected} ligne(s) corrigee(s), {added} ligne(s) ajoutee(s).")
 
 
 @backfill_command.error
-async def backfill_command_error(ctx: commands.Context, error: commands.CommandError):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("Tu dois etre administrateur pour lancer un backfill.")
+async def backfill_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Tu dois etre administrateur pour lancer un backfill.", ephemeral=True)
     else:
         raise error
 
 
 @bot.event
 async def on_message(message: discord.Message):
-    await bot.process_commands(message)
-
     if WATCH_CHANNEL_ID and message.channel.id != WATCH_CHANNEL_ID:
         return
     if not message.author.bot:
@@ -272,7 +276,7 @@ async def on_message(message: discord.Message):
             if not strength:
                 strength = last_win_strength(player)
 
-        timestamp = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+        timestamp = datetime.now(TIMEZONE).isoformat(timespec="seconds")
         server = message.guild.name if message.guild else ""
 
         _sheet.append_row(
