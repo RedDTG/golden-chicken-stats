@@ -34,7 +34,7 @@ PERCENT_RE = re.compile(r"(\d+)\s*%")
 BET_RE = re.compile(r"\+cf\s+([\d,]+)", re.IGNORECASE)
 
 HEADER = ["Horodatage", "Joueur", "Resultat", "Gain", "Probabilite (%)", "Message ID", "Serveur"]
-OVERVIEW_HEADER = ["", "Total", "Defaites", "Victoires", "Meilleur %", "Rentabilite", "Ratio"]
+OVERVIEW_HEADER = ["", "Total", "Defaites", "Victoires", "Ratio", "Meilleur %", "Rentabilite"]
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 if GOOGLE_CREDENTIALS_JSON:
@@ -118,7 +118,7 @@ def update_overview() -> None:
     for name in ["Total"] + sorted(p for p in stats if p != "Total"):
         data = stats[name]
         ratio = round(data["wins"] / data["total"] * 100) if data["total"] else ""
-        values = [data["total"], data["defeats"], data["wins"], data["best_percent"] or "", data["profit"], ratio]
+        values = [data["total"], data["defeats"], data["wins"], ratio, data["best_percent"] or "", data["profit"]]
         if name in existing:
             updates.append({"range": f"B{existing[name]}:G{existing[name]}", "values": [values]})
         else:
