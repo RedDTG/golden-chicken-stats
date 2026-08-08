@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -89,9 +90,123 @@ async def find_bet_amount(message: discord.Message, player: str) -> str:
     return ""
 
 
+def _existing_rows() -> dict[str, int]:
+    values = _sheet.get_all_values()
+    return {row[5]: i for i, row in enumerate(values, start=1) if i > 1 and len(row) > 5 and row[5]}
+
+
+def _watched_channels(client: discord.Client) -> list[discord.TextChannel]:
+    if WATCH_CHANNEL_ID:
+        channel = client.get_channel(WATCH_CHANNEL_ID)
+        return [channel] if channel else []
+
+    channels = []
+    for guild in client.guilds:
+        channels.extend(c for c in guild.text_channels if c.permissions_for(guild.me).read_message_history)
+    return channels
+
+
+async def _channel_group(channel: discord.TextChannel) -> list[discord.abc.Messageable]:
+    """Le salon lui-meme plus tous ses fils (actifs et archives, publics et prives),
+    car channel.history() ne descend pas dans les fils."""
+    group = [channel]
+
+    active = await channel.guild.active_threads()
+    group.extend(t for t in active if t.parent_id == channel.id)
+
+    try:
+        group.extend([t async for t in channel.archived_threads(limit=None)])
+    except discord.Forbidden:
+        pass
+    try:
+        group.extend([t async for t in channel.archived_threads(private=True, limit=None)])
+    except discord.Forbidden:
+        pass
+
+    return group
+
+
+async def run_backfill(client: discord.Client) -> tuple[int, int]:
+    """Rescanne l'historique des salons surveilles (et leurs fils) pour corriger
+    les lignes existantes (Resultat/Gain/Probabilite) et ajouter les combats jamais
+    logues. Retourne (lignes corrigees, lignes ajoutees)."""
+    ensure_header()
+    existing = _existing_rows()
+    channels = _watched_channels(client)
+    if not channels:
+        log.warning("Aucun salon accessible trouve.")
+        return 0, 0
+
+    updates = []
+    corrected_rows: set[int] = set()
+    new_rows = []
+    last_win_percent: dict[str, str] = {}
+
+    for channel in channels:
+        subchannels = await _channel_group(channel)
+        log.info("Analyse du salon #%s (%d fil(s) inclus)...", channel.name, len(subchannels) - 1)
+
+        messages = []
+        for sub in subchannels:
+            messages.extend([m async for m in sub.history(limit=None, oldest_first=True)])
+        messages.sort(key=lambda m: m.id)
+
+        for message in messages:
+            if not message.author.bot:
+                continue
+            if UNBELIEVABOAT_ID and message.author.id != UNBELIEVABOAT_ID:
+                continue
+            if not message.embeds:
+                continue
+
+            for embed in message.embeds:
+                parsed = parse_cockfight_embed(embed)
+                if parsed is None:
+                    continue
+
+                player, result, gain, strength = parsed
+
+                if result == "Victoire" and strength:
+                    last_win_percent[player] = strength
+
+                if result == "Defaite":
+                    bet = await find_bet_amount(message, player)
+                    if bet:
+                        gain = f"-{bet}"
+                    if not strength:
+                        strength = str(int(last_win_percent[player]) + 1) if player in last_win_percent else "50"
+
+                msg_id = str(message.id)
+                server = message.guild.name if message.guild else ""
+
+                if msg_id in existing:
+                    row = existing[msg_id]
+                    corrected_rows.add(row)
+                    updates.append({"range": f"C{row}:E{row}", "values": [[result, gain, strength]]})
+                    updates.append({"range": f"G{row}", "values": [[server]]})
+                else:
+                    timestamp = message.created_at.astimezone().isoformat(timespec="seconds")
+                    new_rows.append([timestamp, player, result, gain, strength, msg_id, server])
+
+    if updates:
+        _sheet.batch_update(updates, value_input_option="USER_ENTERED")
+        log.info("%d ligne(s) corrigee(s).", len(corrected_rows))
+    else:
+        log.info("Aucune ligne a corriger.")
+
+    if new_rows:
+        _sheet.append_rows(new_rows, value_input_option="USER_ENTERED")
+        log.info("%d ligne(s) ajoutee(s).", len(new_rows))
+    else:
+        log.info("Aucune nouvelle ligne a ajouter.")
+
+    return len(corrected_rows), len(new_rows)
+
+
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+_backfill_lock = asyncio.Lock()
 
 
 @bot.event
@@ -103,8 +218,37 @@ async def on_ready():
         log.info("Connecte en tant que %s - ecoute de tous les salons", bot.user)
 
 
+@bot.command(name="backfill")
+@commands.has_permissions(administrator=True)
+async def backfill_command(ctx: commands.Context):
+    if _backfill_lock.locked():
+        await ctx.send("Un backfill est deja en cours.")
+        return
+
+    async with _backfill_lock:
+        await ctx.send("Backfill en cours, ca peut prendre un moment...")
+        try:
+            corrected, added = await run_backfill(bot)
+        except Exception:
+            log.exception("Erreur pendant le backfill")
+            await ctx.send("Le backfill a echoue, voir les logs.")
+            return
+
+        await ctx.send(f"Backfill termine : {corrected} ligne(s) corrigee(s), {added} ligne(s) ajoutee(s).")
+
+
+@backfill_command.error
+async def backfill_command_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("Tu dois etre administrateur pour lancer un backfill.")
+    else:
+        raise error
+
+
 @bot.event
 async def on_message(message: discord.Message):
+    await bot.process_commands(message)
+
     if WATCH_CHANNEL_ID and message.channel.id != WATCH_CHANNEL_ID:
         return
     if not message.author.bot:
