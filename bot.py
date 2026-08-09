@@ -509,7 +509,7 @@ async def on_message(message: discord.Message):
                 balance = parse_balance_embed(embed)
                 if balance is not None:
                     player, cash, bank_amount, total = balance
-                    timestamp = datetime.now(TIMEZONE).isoformat(timespec="seconds")
+                    timestamp = message.created_at.astimezone(TIMEZONE).isoformat(timespec="seconds")
                     server = message.guild.name if message.guild else ""
                     _bank_sheet.append_row(
                         [timestamp, player, cash, bank_amount, total, str(message.id), server],
@@ -527,7 +527,7 @@ async def on_message(message: discord.Message):
             if not strength:
                 strength = last_win_strength(player)
 
-        timestamp = datetime.now(TIMEZONE).isoformat(timespec="seconds")
+        timestamp = message.created_at.astimezone(TIMEZONE).isoformat(timespec="seconds")
         server = message.guild.name if message.guild else ""
 
         _sheet.append_row(
