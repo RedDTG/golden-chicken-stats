@@ -39,8 +39,8 @@ BET_RE = re.compile(r"\+cf\s+([\d,]+)", re.IGNORECASE)
 CUSTOM_EMOJI_RE = re.compile(r"<a?:\w+:\d+>")
 AMOUNT_RE = re.compile(r"([\d,]+)")
 
-HEADER = ["Horodatage", "Joueur", "Resultat", "Gain", "Probabilite (%)", "Message ID", "Serveur"]
-OVERVIEW_HEADER = ["Utilisateur", "Total", "Defaites", "Victoires", "Winrate", "Meilleur poulet", "Rentabilite"]
+HEADER = ["Horodatage", "Joueur", "Resultat", "Gain", "Probabilite (%)", "Message ID", "Serveur", "ID Joueur"]
+OVERVIEW_HEADER = ["Utilisateur", "Total", "Defaites", "Victoires", "Winrate", "Meilleur poulet", "Rentabilite", "ID Joueur"]
 BANK_HEADER = ["Horodatage", "Joueur", "Cash", "Banque", "Total", "Message ID", "Serveur"]
 
 # Rempli au demarrage (on_ready) via fetch_user: l'embed +bal d'UnbelievaBoat
@@ -125,19 +125,28 @@ def last_win_strength(player: str) -> str:
 
 def update_overview() -> None:
     """Recalcule la feuille Overview (une ligne par joueur + une ligne 'Total')
-    a partir de l'ensemble des lignes de la feuille principale."""
+    a partir de l'ensemble des lignes de la feuille principale. Regroupe par ID
+    Discord (colonne H de la feuille principale) plutot que par pseudo affiche,
+    car deux joueurs differents peuvent partager le meme pseudo/surnom sur un
+    serveur - les lignes anterieures a l'ajout de cette colonne (sans ID) se
+    replient sur un regroupement par pseudo, corrige des qu'un /backfill est
+    relance pour leur retro-attribuer un ID."""
     stats: dict[str, dict[str, int]] = {}
+    names: dict[str, str] = {"total": "Total"}
 
-    def entry(name: str) -> dict[str, int]:
-        return stats.setdefault(name, {"total": 0, "defeats": 0, "wins": 0, "best_percent": 0, "profit": 0})
+    def entry(key: str) -> dict[str, int]:
+        return stats.setdefault(key, {"total": 0, "defeats": 0, "wins": 0, "best_percent": 0, "profit": 0})
 
     for row in _sheet.get_all_values()[1:]:
         if len(row) < 4:
             continue
         player, result, gain = row[1], row[2], row[3]
+        player_id = row[7] if len(row) > 7 and row[7] else ""
+        key = f"id:{player_id}" if player_id else f"name:{player.lower()}"
+        names[key] = player
 
-        for target in (player, "Total"):
-            data = entry(target)
+        for target_key in (key, "total"):
+            data = entry(target_key)
             data["total"] += 1
             if result == "Victoire":
                 data["wins"] += 1
@@ -148,21 +157,35 @@ def update_overview() -> None:
             if result == "Victoire" and len(row) > 4 and row[4].isdigit():
                 data["best_percent"] = max(data["best_percent"], int(row[4]))
 
-    existing = {
-        row[0]: i for i, row in enumerate(_overview_sheet.get_all_values(), start=1) if i > 1 and row and row[0]
-    }
+    overview_rows = _overview_sheet.get_all_values()
+    existing_by_id = {row[7]: i for i, row in enumerate(overview_rows, start=1) if i > 1 and len(row) > 7 and row[7]}
+    existing_by_name = {row[0]: i for i, row in enumerate(overview_rows, start=1) if i > 1 and row and row[0]}
+    claimed_name_rows: set[int] = set()
 
     updates = []
     new_rows = []
-    for name in ["Total"] + sorted(p for p in stats if p != "Total"):
-        data = stats[name]
+    for key in ["total"] + sorted((k for k in stats if k != "total"), key=lambda k: names[k]):
+        data = stats[key]
+        display_name = names[key]
+        id_value = key[3:] if key.startswith("id:") else ""
         winrate = round(data["wins"] / data["total"] * 100) / 100 if data["total"] else ""
         best_chicken = data["best_percent"] / 100 if data["best_percent"] else ""
-        values = [data["total"], data["defeats"], data["wins"], winrate, best_chicken, data["profit"]]
-        if name in existing:
-            updates.append({"range": f"B{existing[name]}:G{existing[name]}", "values": [values]})
+        values = [data["total"], data["defeats"], data["wins"], winrate, best_chicken, data["profit"], id_value]
+
+        row_index = existing_by_id.get(id_value) if id_value else None
+        if row_index is None:
+            # Repli par pseudo (ligne pas encore rattachee a un ID). "Reclame"
+            # la ligne pour eviter que deux joueurs au meme pseudo ne se
+            # disputent - et s'ecrasent mutuellement - la meme ligne existante.
+            candidate = existing_by_name.get(display_name)
+            if candidate is not None and candidate not in claimed_name_rows:
+                row_index = candidate
+                claimed_name_rows.add(candidate)
+
+        if row_index is not None:
+            updates.append({"range": f"A{row_index}:H{row_index}", "values": [[display_name, *values]]})
         else:
-            new_rows.append([name, *values])
+            new_rows.append([display_name, *values])
 
     if updates:
         _overview_sheet.batch_update(updates, value_input_option="USER_ENTERED")
@@ -170,7 +193,17 @@ def update_overview() -> None:
         _overview_sheet.append_rows(new_rows, value_input_option="USER_ENTERED")
 
 
-async def find_bet_amount(message: discord.Message, player: str) -> str:
+async def find_command_info(message: discord.Message, player: str) -> tuple[str, int | None]:
+    """Cherche en arriere (jusqu'a 10 messages) le +cf du joueur ayant produit
+    ce resultat: renvoie (montant mise ou '', ID Discord de l'auteur ou None).
+    L'ID sert de cle stable pour l'agregation Overview: embed.author.name (le
+    pseudo affiche par UnbelievaBoat) n'est pas garanti unique sur un serveur
+    (doublons de pseudo/surnom), contrairement a message.author.id de qui a
+    tape la commande. Limite connue: la recherche elle-meme filtre encore par
+    pseudo (prev.author.name/display_name) pour ignorer les +cf d'autres
+    joueurs intercales dans le salon, donc si deux joueurs au pseudo identique
+    parient au meme moment, le mauvais ID peut etre attribue - inevitable sans
+    lien requete/reponse fourni par UnbelievaBoat lui-meme."""
     player = player.lower()
     async for prev in message.channel.history(limit=10, before=message):
         if prev.author.bot:
@@ -185,8 +218,9 @@ async def find_bet_amount(message: discord.Message, player: str) -> str:
         # (ex. "+cf all"), plutot que de continuer vers un +cf plus ancien
         # et sans rapport (ex. une commande precedente ratee).
         match = BET_RE.search(prev.content)
-        return match.group(1).replace(",", "") if match else ""
-    return ""
+        bet = match.group(1).replace(",", "") if match else ""
+        return bet, prev.author.id
+    return "", None
 
 
 def _existing_rows() -> dict[str, int]:
@@ -283,12 +317,12 @@ async def run_backfill(client: discord.Client) -> tuple[int, int]:
                     continue
 
                 player, result, gain, strength = parsed
+                bet, player_id = await find_command_info(message, player)
 
                 if result == "Victoire" and strength:
                     last_win_percent[player] = strength
 
                 if result == "Defaite":
-                    bet = await find_bet_amount(message, player)
                     if bet:
                         gain = f"-{bet}"
                     if not strength:
@@ -300,15 +334,16 @@ async def run_backfill(client: discord.Client) -> tuple[int, int]:
                 msg_id = str(message.id)
                 server = message.guild.name if message.guild else ""
                 timestamp = message.created_at.astimezone(TIMEZONE).isoformat(timespec="seconds")
+                id_value = str(player_id) if player_id else ""
 
                 if msg_id in existing:
                     row = existing[msg_id]
                     corrected_rows.add(row)
                     updates.append({"range": f"A{row}", "values": [[timestamp]]})
                     updates.append({"range": f"C{row}:E{row}", "values": [[result, gain, strength]]})
-                    updates.append({"range": f"G{row}", "values": [[server]]})
+                    updates.append({"range": f"G{row}:H{row}", "values": [[server, id_value]]})
                 else:
-                    new_rows.append([timestamp, player, result, gain, strength, msg_id, server])
+                    new_rows.append([timestamp, player, result, gain, strength, msg_id, server, id_value])
 
     if updates:
         _sheet.batch_update(updates, value_input_option="USER_ENTERED")
@@ -484,9 +519,9 @@ async def on_message(message: discord.Message):
             continue
 
         player, result, gain, strength = parsed
+        bet, player_id = await find_command_info(message, player)
 
         if result == "Defaite":
-            bet = await find_bet_amount(message, player)
             if bet:
                 gain = f"-{bet}"
             if not strength:
@@ -496,7 +531,7 @@ async def on_message(message: discord.Message):
         server = message.guild.name if message.guild else ""
 
         _sheet.append_row(
-            [timestamp, player, result, gain, strength, str(message.id), server],
+            [timestamp, player, result, gain, strength, str(message.id), server, str(player_id) if player_id else ""],
             value_input_option="USER_ENTERED",
         )
         update_overview()
