@@ -212,14 +212,23 @@ async def run_backfill(client: discord.Client) -> tuple[int, int]:
 
         messages = []
         for sub in subchannels:
-            messages.extend([m async for m in sub.history(limit=None, oldest_first=True)])
+            async for m in sub.history(limit=None, oldest_first=True):
+                messages.append(m)
+                now = time.monotonic()
+                if now - last_progress >= PROGRESS_INTERVAL:
+                    log.info(
+                        "... recuperation: #%s, message du %s",
+                        sub.name,
+                        m.created_at.astimezone(TIMEZONE).isoformat(timespec="seconds"),
+                    )
+                    last_progress = now
         messages.sort(key=lambda m: m.id)
 
         for message in messages:
             now = time.monotonic()
             if now - last_progress >= PROGRESS_INTERVAL:
                 log.info(
-                    "... en cours: #%s, message du %s",
+                    "... traitement: #%s, message du %s",
                     message.channel.name,
                     message.created_at.astimezone(TIMEZONE).isoformat(timespec="seconds"),
                 )
