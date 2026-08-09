@@ -38,6 +38,10 @@ PERCENT_RE = re.compile(r"(\d+)\s*%")
 BET_RE = re.compile(r"\+cf\s+([\d,]+)", re.IGNORECASE)
 CUSTOM_EMOJI_RE = re.compile(r"<a?:\w+:\d+>")
 AMOUNT_RE = re.compile(r"([\d,]+)")
+# Ancien format d'embed UnbelievaBoat (~2019): embed.author.name porte encore
+# le discriminant legacy "Pseudo#1234". On le retire pour que "Joueur" reste
+# comparable au pseudo actuel (sans discriminant) utilise partout ailleurs.
+DISCRIMINATOR_RE = re.compile(r"#\d{4}$")
 
 HEADER = ["Horodatage", "Joueur", "Resultat", "Gain", "Probabilite (%)", "Message ID", "Serveur", "ID Joueur"]
 OVERVIEW_HEADER = ["Utilisateur", "Total", "Defaites", "Victoires", "Winrate", "Meilleur poulet", "Rentabilite", "ID Joueur"]
@@ -71,15 +75,22 @@ def ensure_header() -> None:
 
 def parse_cockfight_embed(embed: discord.Embed):
     description = embed.description or ""
-    player = embed.author.name if embed.author and embed.author.name else "Inconnu"
+    raw_name = embed.author.name if embed.author and embed.author.name else "Inconnu"
+    player = DISCRIMINATOR_RE.sub("", raw_name)
 
     percent_match = PERCENT_RE.search(embed.footer.text or "")
     strength = percent_match.group(1) if percent_match else ""
 
-    if "lost the fight" in description.lower():
+    description_lower = description.lower()
+
+    # "chicken died" est l'ancien libelle de defaite (~2019, embed.author au
+    # format "Pseudo#1234", pas de footer de probabilite) - remplace depuis
+    # par "lost the fight", mais toujours present dans le vieil historique
+    # qu'un /backfill doit pouvoir relire.
+    if "lost the fight" in description_lower or "chicken died" in description_lower:
         return player, "Defaite", "", strength
 
-    if "won the fight" in description.lower():
+    if "won the fight" in description_lower:
         gain_match = WIN_GAIN_RE.search(description)
         gain = gain_match.group(1).replace(",", "") if gain_match else ""
         return player, "Victoire", gain, strength
