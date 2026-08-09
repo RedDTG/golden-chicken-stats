@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections import Counter
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -20,6 +21,7 @@ DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Paris"))
 WATCH_CHANNEL_ID = int(os.environ["WATCH_CHANNEL_ID"]) if os.environ.get("WATCH_CHANNEL_ID") else None
 UNBELIEVABOAT_ID = int(os.environ.get("UNBELIEVABOAT_ID", "0") or 0)
+PROGRESS_INTERVAL = float(os.environ.get("BACKFILL_PROGRESS_INTERVAL", "5"))
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 GOOGLE_CREDENTIALS_FILE = os.environ.get("GOOGLE_CREDENTIALS_FILE", "credentials.json")
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
@@ -202,6 +204,7 @@ async def run_backfill(client: discord.Client) -> tuple[int, int]:
     corrected_rows: set[int] = set()
     new_rows = []
     last_win_percent: dict[str, str] = {}
+    last_progress = time.monotonic()
 
     for channel in channels:
         subchannels = await _channel_group(channel)
@@ -213,6 +216,15 @@ async def run_backfill(client: discord.Client) -> tuple[int, int]:
         messages.sort(key=lambda m: m.id)
 
         for message in messages:
+            now = time.monotonic()
+            if now - last_progress >= PROGRESS_INTERVAL:
+                log.info(
+                    "... en cours: #%s, message du %s",
+                    message.channel.name,
+                    message.created_at.astimezone(TIMEZONE).isoformat(timespec="seconds"),
+                )
+                last_progress = now
+
             if not message.author.bot:
                 continue
             if UNBELIEVABOAT_ID and message.author.id != UNBELIEVABOAT_ID:
