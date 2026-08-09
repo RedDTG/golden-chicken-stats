@@ -72,16 +72,17 @@ def parse_cockfight_embed(embed: discord.Embed):
 
 
 def last_win_strength(player: str) -> str:
+    """Estime la probabilite du poulet actuel du joueur: chaque poulet neuf
+    (achete apres une Defaite, qui le tue toujours) repart a 50%, et ne
+    remonte que lorsqu'une Victoire confirme le palier suivant."""
     values = _sheet.get_all_values()
-    wins = [
-        row
-        for row in values[1:]
-        if len(row) > 4 and row[1] == player and row[2] == "Victoire" and row[4].isdigit() and row[0]
-    ]
-    if not wins:
+    rows = [row for row in values[1:] if len(row) > 4 and row[1] == player and row[0]]
+    if not rows:
         return "50"
-    latest = max(wins, key=lambda row: datetime.fromisoformat(row[0]))
-    return str(int(latest[4]) + 1)
+    latest = max(rows, key=lambda row: datetime.fromisoformat(row[0]))
+    if latest[2] == "Victoire" and latest[4].isdigit():
+        return str(int(latest[4]) + 1)
+    return "50"
 
 
 def update_overview() -> None:
@@ -235,6 +236,9 @@ async def run_backfill(client: discord.Client) -> tuple[int, int]:
                         gain = f"-{bet}"
                     if not strength:
                         strength = str(int(last_win_percent[player]) + 1) if player in last_win_percent else "50"
+                    # Une Defaite tue toujours le poulet: le suivant reparaitra a 50%
+                    # tant qu'aucune nouvelle Victoire ne confirme un palier plus haut.
+                    last_win_percent[player] = "49"
 
                 msg_id = str(message.id)
                 server = message.guild.name if message.guild else ""
