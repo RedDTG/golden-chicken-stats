@@ -8,6 +8,7 @@ Bot Discord qui surveille les résultats de cockfight d'UnbelievaBoat et les jou
 - **`/backfill`** (réservée aux administrateurs) : rescanne tout l'historique du salon surveillé (et de ses fils, actifs et archivés) pour corriger les lignes déjà loguées et ajouter celles qui manquent. Utile après une correction de bug de parsing ou une coupure du bot.
 - **`/stats`** : affiche un embed avec les statistiques du serveur (combats, victoires, défaites, meilleur/pire winrate, poulet obtenu à la plus haute probabilité).
 - **Feuille `Overview`** : une ligne par joueur (+ une ligne `Total`) avec Total / Défaites / Victoires / Winrate / Meilleur poulet / Rentabilité, recalculée automatiquement à chaque combat logué et après chaque backfill.
+- **Feuille `Bank`** : journalise en temps réel chaque `+bal` observé dans le salon surveillé (par n'importe qui, pas seulement les joueurs suivis) concernant un membre listé dans `TRACKED_MEMBER_IDS` (joueur, cash, banque, total, horodatage, serveur). Écoute passive uniquement — le bot n'envoie jamais `+bal` lui-même. Non couvert par `/backfill` (temps réel uniquement).
 
 ## Prérequis
 
@@ -38,6 +39,8 @@ Toutes les variables sont documentées dans [.env.example](.env.example) et char
 | `GOOGLE_SHEET_TAB` | non (défaut `Cockfights`) | Onglet des lignes de combats, doit déjà exister. |
 | `OVERVIEW_SHEET_TAB` | non (défaut `Overview`) | Onglet récapitulatif par joueur, doit déjà exister. |
 | `TIMEZONE` | non (défaut `Europe/Paris`) | Fuseau IANA utilisé pour l'Horodatage, indépendant du fuseau système de la machine qui héberge le bot. |
+| `BANK_SHEET_TAB` | non (défaut `Bank`) | Onglet des balances suivies, doit déjà exister. |
+| `TRACKED_MEMBER_IDS` | non | IDs Discord séparés par des virgules des membres dont les `+bal` doivent être journalisés dans `Bank`. Vide = suivi désactivé. |
 
 ### Créer le bot Discord
 

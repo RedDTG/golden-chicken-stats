@@ -27,6 +27,8 @@ GOOGLE_CREDENTIALS_FILE = os.environ.get("GOOGLE_CREDENTIALS_FILE", "credentials
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 GOOGLE_SHEET_TAB = os.environ.get("GOOGLE_SHEET_TAB", "Cockfights")
 OVERVIEW_SHEET_TAB = os.environ.get("OVERVIEW_SHEET_TAB", "Overview")
+BANK_SHEET_TAB = os.environ.get("BANK_SHEET_TAB", "Bank")
+TRACKED_MEMBER_IDS = {int(x) for x in os.environ.get("TRACKED_MEMBER_IDS", "").split(",") if x.strip()}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("cockfight-tracker")
@@ -34,9 +36,18 @@ log = logging.getLogger("cockfight-tracker")
 WIN_GAIN_RE = re.compile(r"([\d,]+)\s*richer", re.IGNORECASE)
 PERCENT_RE = re.compile(r"(\d+)\s*%")
 BET_RE = re.compile(r"\+cf\s+([\d,]+)", re.IGNORECASE)
+CUSTOM_EMOJI_RE = re.compile(r"<a?:\w+:\d+>")
+AMOUNT_RE = re.compile(r"([\d,]+)")
 
 HEADER = ["Horodatage", "Joueur", "Resultat", "Gain", "Probabilite (%)", "Message ID", "Serveur"]
 OVERVIEW_HEADER = ["Utilisateur", "Total", "Defaites", "Victoires", "Winrate", "Meilleur poulet", "Rentabilite"]
+BANK_HEADER = ["Horodatage", "Joueur", "Cash", "Banque", "Total", "Message ID", "Serveur"]
+
+# Rempli au demarrage (on_ready) via fetch_user: l'embed +bal d'UnbelievaBoat
+# n'expose pas l'ID Discord, seulement embed.author.name (le pseudo brut, meme
+# source que "Joueur" pour les cockfights) - on resout donc TRACKED_MEMBER_IDS
+# en pseudos une fois au demarrage pour pouvoir matcher par nom ensuite.
+tracked_usernames: set[str] = set()
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 if GOOGLE_CREDENTIALS_JSON:
@@ -46,6 +57,7 @@ else:
 _gc = gspread.authorize(_creds)
 _sheet = _gc.open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_TAB)
 _overview_sheet = _gc.open_by_key(GOOGLE_SHEET_ID).worksheet(OVERVIEW_SHEET_TAB)
+_bank_sheet = _gc.open_by_key(GOOGLE_SHEET_ID).worksheet(BANK_SHEET_TAB)
 
 
 def ensure_header() -> None:
@@ -53,6 +65,8 @@ def ensure_header() -> None:
         _sheet.update("A1", [HEADER])
     if _overview_sheet.row_values(1) != OVERVIEW_HEADER:
         _overview_sheet.update("A1", [OVERVIEW_HEADER])
+    if _bank_sheet.row_values(1) != BANK_HEADER:
+        _bank_sheet.update("A1", [BANK_HEADER])
 
 
 def parse_cockfight_embed(embed: discord.Embed):
@@ -71,6 +85,28 @@ def parse_cockfight_embed(embed: discord.Embed):
         return player, "Victoire", gain, strength
 
     return None
+
+
+def parse_balance_embed(embed: discord.Embed):
+    """Parse un embed +bal d'UnbelievaBoat, uniquement pour un des joueurs
+    suivis (TRACKED_MEMBER_IDS resolus en pseudos dans tracked_usernames)."""
+    player = embed.author.name if embed.author and embed.author.name else None
+    if not player or player.lower() not in tracked_usernames:
+        return None
+
+    amounts = {"cash": "", "bank": "", "total": ""}
+    for field in embed.fields:
+        name = (field.name or "").strip().lower()
+        key = next((k for k in amounts if name.startswith(k)), None)
+        if key is None:
+            continue
+        value = CUSTOM_EMOJI_RE.sub("", field.value or "")
+        match = AMOUNT_RE.search(value)
+        amounts[key] = match.group(1).replace(",", "") if match else ""
+
+    if not amounts["total"]:
+        return None
+    return player, amounts["cash"], amounts["bank"], amounts["total"]
 
 
 def last_win_strength(player: str) -> str:
@@ -345,6 +381,17 @@ async def _sync_guild_commands(guild: discord.Guild) -> None:
 @bot.event
 async def on_ready():
     ensure_header()
+    global tracked_usernames
+    tracked_usernames = set()
+    for user_id in TRACKED_MEMBER_IDS:
+        try:
+            user = await bot.fetch_user(user_id)
+        except discord.HTTPException:
+            log.warning("Impossible de resoudre l'utilisateur suivi %d", user_id)
+            continue
+        tracked_usernames.add(user.name.lower())
+    if TRACKED_MEMBER_IDS:
+        log.info("%d membre(s) suivi(s) pour la feuille Bank", len(tracked_usernames))
     try:
         # On synchronise uniquement par serveur (quasi instantane) : un sync
         # global met jusqu'a une heure a apparaitre, et le combiner avec un
@@ -423,6 +470,17 @@ async def on_message(message: discord.Message):
     for embed in message.embeds:
         parsed = parse_cockfight_embed(embed)
         if parsed is None:
+            if tracked_usernames:
+                balance = parse_balance_embed(embed)
+                if balance is not None:
+                    player, cash, bank_amount, total = balance
+                    timestamp = datetime.now(TIMEZONE).isoformat(timespec="seconds")
+                    server = message.guild.name if message.guild else ""
+                    _bank_sheet.append_row(
+                        [timestamp, player, cash, bank_amount, total, str(message.id), server],
+                        value_input_option="USER_ENTERED",
+                    )
+                    log.info("Bank: %s - cash=%s banque=%s total=%s", player, cash, bank_amount, total)
             continue
 
         player, result, gain, strength = parsed

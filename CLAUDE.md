@@ -24,6 +24,8 @@ Required environment variables (see `.env.example`, loaded via `python-dotenv`):
 - `GOOGLE_SHEET_TAB` (default `Cockfights`) — worksheet/tab name; must already exist in the sheet.
 - `OVERVIEW_SHEET_TAB` (default `Overview`) — second worksheet/tab name for the per-player rollup kept up to date by `update_overview()`; must already exist in the sheet.
 - `TIMEZONE` (default `Europe/Paris`) — IANA zone name used to render the Horodatage column, via `zoneinfo`. Deliberately independent of the host machine's system timezone (a bare `.astimezone()` on a UTC-configured server/container silently produces `+00:00` timestamps instead of local time — this bit us once, see `tzdata` in `requirements.txt` for the portable data source).
+- `BANK_SHEET_TAB` (default `Bank`) — third worksheet/tab name for the `+bal` tracking described below; must already exist in the sheet.
+- `TRACKED_MEMBER_IDS` (optional) — comma-separated Discord user IDs whose `+bal` results get logged to the `Bank` tab. Empty/unset disables the feature entirely (no fetch at startup, no matching at runtime).
 
 There is no test suite, linter, or build step in this repo currently.
 
@@ -39,6 +41,16 @@ Everything lives in `bot.py` and runs as one process with no persistence besides
 6. **Sheet append**: each parsed result becomes one row (`timestamp, player, result, gain, strength, message_id, server`) appended with `append_row(..., value_input_option="USER_ENTERED")`, where `server` is `message.guild.name` and `timestamp` is `datetime.now(TIMEZONE)` (real time of processing — not the message's own creation time). The Serveur column was added at the end of `HEADER` (not inserted between existing columns) specifically to avoid shifting the columns of rows already present in a live sheet.
 
 Because parsing is purely regex/string-matching against UnbelievaBoat's embed text (and the player's own bet command), any wording change in that bot's cockfight messages requires updating `WIN_GAIN_RE`, `PERCENT_RE`, `BET_RE`, or the `"lost the fight"`/`"won the fight"` checks in `parse_cockfight_embed`.
+
+## Bank tracking (`+bal`)
+
+Passive-only: the bot never sends `+bal` itself, it just logs whenever a `+bal` result for a tracked member happens to appear in the watched channel (triggered by anyone — the tracked member themselves, another user, or another bot/self-bot). Lives in the same `on_message`/`run_backfill`-adjacent embed loop as cockfight parsing, but **not** wired into `run_backfill()` — Bank logging is real-time only, there is no historical rescan for it.
+
+1. **Resolving IDs to names** (`on_ready`): `TRACKED_MEMBER_IDS` is a set of Discord snowflakes, but UnbelievaBoat's `+bal` embed doesn't expose the target's ID anywhere — only `embed.author.name`, the same raw-username field already relied on as `Joueur` for cockfights (see `parse_cockfight_embed` above). So at startup each ID is resolved once via `bot.fetch_user()` into its lowercased username, cached in the module-global `tracked_usernames`. A user who renames after the bot started keeps being matched under their old username until the bot restarts. If `TRACKED_MEMBER_IDS` is empty, `tracked_usernames` stays empty and `on_message` skips the balance-parsing branch entirely (cheap no-op check on every embed).
+2. **Parsing** (`parse_balance_embed`): rejects the embed outright unless `embed.author.name.lower()` is in `tracked_usernames` — this is what keeps the Bank tab scoped to only the configured members even though the bot sees every `+bal` in the channel, not just theirs. Field values go through the same `CUSTOM_EMOJI_RE` strip as `golden-chicken-finder`'s balance parsing before the digits are extracted (`AMOUNT_RE`) — UnbelievaBoat's custom currency emoji embeds a numeric snowflake between the amount and the field text, and matching digits before stripping it grabs the emoji's ID instead of the balance (this exact bug already happened once in the sibling repo, see its CLAUDE.md). Matches `Cash`/`Bank`/`Total` fields by prefix (case-insensitive on `field.name`), same convention as the win-percent/gain parsing elsewhere in this file. Returns `None` (nothing logged) if no `Total` field was found, since that means the embed isn't really a balance response.
+3. **Sheet append**: one row per observed `+bal` — `timestamp, player, cash, bank, total, message_id, server` — via `_bank_sheet.append_row(...)`, mirroring the Cockfights append but with its own header (`BANK_HEADER`) and its own tab (`BANK_SHEET_TAB`). No overview/rollup sheet for Bank — it's a raw log, not aggregated.
+
+Known gap: because matching is by username rather than ID, `parse_balance_embed` would also (mis)match an *untracked* user who happens to share a username with a tracked one — accepted as unlikely given Discord's globally-unique username constraint, same trust level the codebase already extends to `embed.author.name` elsewhere.
 
 ## Backfill
 
