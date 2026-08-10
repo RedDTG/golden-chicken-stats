@@ -35,6 +35,7 @@ TRACKED_MEMBER_IDS = {int(x) for x in os.environ.get("TRACKED_MEMBER_IDS", "").s
 # durabilite qu'il apporte ne couvre plus qu'un simple crash/restart du process.
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
 SYNC_INTERVAL = float(os.environ.get("SYNC_INTERVAL", "15"))
+RECORD_CHANNEL_ID = int(os.environ["RECORD_CHANNEL_ID"]) if os.environ.get("RECORD_CHANNEL_ID") else None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("cockfight-tracker")
@@ -61,6 +62,13 @@ BANK_HEADER = ["Horodatage", "Joueur", "Cash", "Banque", "Total", "Message ID", 
 # source que "Joueur" pour les cockfights) - on resout donc TRACKED_MEMBER_IDS
 # en pseudos une fois au demarrage pour pouvoir matcher par nom ensuite.
 tracked_usernames: set[str] = set()
+
+# Rempli au demarrage (on_ready, voir _load_best_strength()) et rafraichi
+# silencieusement apres un /backfill: probabilite de victoire la plus haute
+# jamais enregistree, par serveur. Comparee a chaque nouvelle Victoire pour
+# detecter un record en temps reel sans re-scanner toute la table a chaque
+# fois (voir _maybe_announce_record()).
+_best_strength_by_server: dict[str, int] = {}
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 if GOOGLE_CREDENTIALS_JSON:
@@ -234,6 +242,59 @@ def last_win_strength(player: str) -> str:
     if result == "Victoire" and strength.isdigit():
         return str(int(strength) + 1)
     return "50"
+
+
+def _load_best_strength() -> None:
+    """(Re)charge le record de probabilite de victoire par serveur depuis
+    SQLite. Appele au demarrage et apres un /backfill (silencieusement - un
+    backfill ne fait que decouvrir de l'historique deja joue, annoncer un
+    "record" a cette occasion n'aurait pas de sens et spammerait le salon)."""
+    global _best_strength_by_server
+    _best_strength_by_server = dict(
+        _db.execute(
+            "SELECT server, MAX(CAST(strength AS INTEGER)) FROM stats "
+            "WHERE result = 'Victoire' AND strength != '' GROUP BY server"
+        )
+    )
+
+
+async def _maybe_announce_record(message: discord.Message, player: str, server: str, strength: int) -> None:
+    """Ping @everyone dans RECORD_CHANNEL_ID quand une Victoire depasse le
+    record de probabilite connu pour ce serveur. Ne fait rien si la fonction
+    n'est pas configuree (RECORD_CHANNEL_ID vide) ou si ce n'est pas un
+    record. L'echec d'annonce (salon introuvable, permissions) est loggue
+    mais ne remonte jamais vers on_message - le combat est deja loggue en
+    base au moment ou cette fonction est appelee, cet echec ne doit rien
+    faire perdre."""
+    if not RECORD_CHANNEL_ID or not message.guild:
+        return
+    if strength <= _best_strength_by_server.get(server, 0):
+        return
+    previous_best = _best_strength_by_server.get(server, 0)
+    _best_strength_by_server[server] = strength
+
+    channel = bot.get_channel(RECORD_CHANNEL_ID)
+    if channel is None:
+        log.warning("RECORD_CHANNEL_ID=%d introuvable, record non annonce.", RECORD_CHANNEL_ID)
+        return
+
+    link = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{message.id}"
+    embed = discord.Embed(
+        title="Nouveau record de meilleur poulet !",
+        description=f"**{player}** a atteint **{strength}%** de probabilite de victoire.",
+        color=discord.Color.gold(),
+        url=link,
+        timestamp=message.created_at,
+    )
+    embed.add_field(name="Joueur", value=player)
+    embed.add_field(name="Nouveau record", value=f"{strength}%")
+    embed.add_field(name="Ancien record", value=f"{previous_best}%" if previous_best else "aucun")
+    embed.add_field(name="Message", value=f"[Voir le combat]({link})", inline=False)
+
+    try:
+        await channel.send(content="@everyone", embed=embed)
+    except discord.HTTPException:
+        log.exception("Echec de l'annonce du nouveau record dans le salon %d", RECORD_CHANNEL_ID)
 
 
 def sync_to_sheets() -> None:
@@ -587,6 +648,7 @@ async def run_backfill(client: discord.Client) -> tuple[int, int]:
     if corrected or added:
         log.info("%d ligne(s) corrigee(s), %d ligne(s) ajoutee(s) (SQLite).", corrected, added)
         sync_to_sheets()
+        _load_best_strength()
     else:
         log.info("Aucune ligne a corriger ou ajouter.")
 
@@ -653,6 +715,7 @@ async def on_ready():
     ensure_header()
     if not sync_loop.is_running():
         sync_loop.start()
+    _load_best_strength()
     global tracked_usernames
     tracked_usernames = set()
     for user_id in TRACKED_MEMBER_IDS:
@@ -780,6 +843,9 @@ async def on_message(message: discord.Message):
         )
         _db.commit()
         log.info("%s - %s - gain=%s - force=%s%%", player, result, gain, strength)
+
+        if result == "Victoire" and strength.isdigit():
+            await _maybe_announce_record(message, player, server, int(strength))
 
 
 if __name__ == "__main__":
