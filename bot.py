@@ -3,15 +3,15 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import time
 from collections import Counter
-from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import discord
 import gspread
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 
@@ -29,6 +29,12 @@ GOOGLE_SHEET_TAB = os.environ.get("GOOGLE_SHEET_TAB", "Cockfights")
 OVERVIEW_SHEET_TAB = os.environ.get("OVERVIEW_SHEET_TAB", "Overview")
 BANK_SHEET_TAB = os.environ.get("BANK_SHEET_TAB", "Bank")
 TRACKED_MEMBER_IDS = {int(x) for x in os.environ.get("TRACKED_MEMBER_IDS", "").split(",") if x.strip()}
+# Chemin du fichier SQLite qui sert de source de verite pour Stats/Bank (voir
+# init_db()). En deploiement conteneurise (Coolify...), ce chemin DOIT etre
+# sur un volume persistant, sinon il est perdu a chaque redeploiement et la
+# durabilite qu'il apporte ne couvre plus qu'un simple crash/restart du process.
+DB_PATH = os.environ.get("DB_PATH", "bot.db")
+SYNC_INTERVAL = float(os.environ.get("SYNC_INTERVAL", "15"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("cockfight-tracker")
@@ -42,6 +48,9 @@ AMOUNT_RE = re.compile(r"([\d,]+)")
 # le discriminant legacy "Pseudo#1234". On le retire pour que "Joueur" reste
 # comparable au pseudo actuel (sans discriminant) utilise partout ailleurs.
 DISCRIMINATOR_RE = re.compile(r"#\d{4}$")
+# Extrait le numero de la premiere ligne d'un append_rows() gspread, ex.
+# "'Stats'!A13379:H13381" -> 13379 (voir _flush_stats()).
+APPEND_ROW_RE = re.compile(r"![A-Z]+(\d+)")
 
 HEADER = ["Horodatage", "Joueur", "Resultat", "Gain", "Probabilite (%)", "Message ID", "Serveur", "ID Joueur"]
 OVERVIEW_HEADER = ["Utilisateur", "Total", "Defaites", "Victoires", "Winrate", "Meilleur poulet", "Rentabilite", "ID Joueur"]
@@ -53,18 +62,6 @@ BANK_HEADER = ["Horodatage", "Joueur", "Cash", "Banque", "Total", "Message ID", 
 # en pseudos une fois au demarrage pour pouvoir matcher par nom ensuite.
 tracked_usernames: set[str] = set()
 
-# update_overview() re-reads the *entire* Stats sheet (13000+ rows and
-# growing) plus the Overview sheet on every single call. Called after every
-# real-time log, that's one full-sheet Sheets-API read pair per cockfight
-# result - with two players farming every few seconds this burns through the
-# Sheets API's per-100s quota fast enough that update_overview() starts
-# throwing (silently, since nothing upstream catches it) and Overview freezes
-# indefinitely. Debounce it: skip a call if the last successful one was too
-# recent: the next real fight naturally triggers a fresh full recompute, so
-# no update is ever permanently lost, just delayed by at most this many seconds.
-OVERVIEW_MIN_INTERVAL = float(os.environ.get("OVERVIEW_MIN_INTERVAL", "20"))
-_last_overview_update = 0.0
-
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 if GOOGLE_CREDENTIALS_JSON:
     _creds = Credentials.from_service_account_info(json.loads(GOOGLE_CREDENTIALS_JSON), scopes=SCOPES)
@@ -74,6 +71,95 @@ _gc = gspread.authorize(_creds)
 _sheet = _gc.open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_TAB)
 _overview_sheet = _gc.open_by_key(GOOGLE_SHEET_ID).worksheet(OVERVIEW_SHEET_TAB)
 _bank_sheet = _gc.open_by_key(GOOGLE_SHEET_ID).worksheet(BANK_SHEET_TAB)
+
+# sqlite3 sur un fichier local: le bot tourne entierement sur un seul thread
+# (la boucle asyncio), donc une connexion partagee sans check_same_thread est
+# sure. WAL pour un meilleur comportement en lecture/ecriture concurrente
+# (ex. /backfill qui tourne pendant que la boucle de sync tourne aussi).
+_db = sqlite3.connect(DB_PATH)
+_db.execute("PRAGMA journal_mode=WAL")
+
+
+def init_db() -> None:
+    """Cree les tables si besoin puis, si elles sont vides (premier lancement
+    ou volume neuf), importe une fois l'historique deja present sur Sheets -
+    sans ca, Overview/last_win_strength/etc. perdraient toute la continuite
+    avec les lignes deja loguees avant ce changement."""
+    _db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS stats (
+            message_id TEXT PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            player TEXT NOT NULL,
+            result TEXT NOT NULL,
+            gain TEXT NOT NULL,
+            strength TEXT NOT NULL,
+            server TEXT NOT NULL,
+            player_id TEXT NOT NULL DEFAULT '',
+            sheet_row INTEGER,
+            synced INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    _db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bank (
+            message_id TEXT PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            player TEXT NOT NULL,
+            cash TEXT NOT NULL,
+            banque TEXT NOT NULL,
+            total TEXT NOT NULL,
+            server TEXT NOT NULL,
+            synced INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    _db.commit()
+    _bootstrap_from_sheets()
+
+
+def _bootstrap_from_sheets() -> None:
+    if _db.execute("SELECT 1 FROM stats LIMIT 1").fetchone() is None:
+        imported = 0
+        for i, row in enumerate(_sheet.get_all_values()[1:], start=2):  # ligne 1 = header
+            if len(row) < 6 or not row[5]:
+                continue
+            timestamp, player, result, gain, strength, message_id = row[0], row[1], row[2], row[3], row[4], row[5]
+            server = row[6] if len(row) > 6 else ""
+            player_id = row[7] if len(row) > 7 else ""
+            cur = _db.execute(
+                "INSERT OR IGNORE INTO stats "
+                "(message_id, timestamp, player, result, gain, strength, server, player_id, sheet_row, synced) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                (message_id, timestamp, player, result, gain, strength, server, player_id, i),
+            )
+            # rowcount vaut 0 si message_id existait deja (Message ID duplique
+            # sur la feuille Stats) - on ne compte que les insertions reelles.
+            imported += cur.rowcount
+        _db.commit()
+        if imported:
+            log.info("Bootstrap: %d ligne(s) Stats importee(s) depuis Sheets vers SQLite.", imported)
+
+    if _db.execute("SELECT 1 FROM bank LIMIT 1").fetchone() is None:
+        imported = 0
+        for row in _bank_sheet.get_all_values()[1:]:
+            if len(row) < 6 or not row[5]:
+                continue
+            timestamp, player, cash, banque, total, message_id = row[0], row[1], row[2], row[3], row[4], row[5]
+            server = row[6] if len(row) > 6 else ""
+            cur = _db.execute(
+                "INSERT OR IGNORE INTO bank (message_id, timestamp, player, cash, banque, total, server, synced) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+                (message_id, timestamp, player, cash, banque, total, server),
+            )
+            imported += cur.rowcount
+        _db.commit()
+        if imported:
+            log.info("Bootstrap: %d ligne(s) Bank importee(s) depuis Sheets vers SQLite.", imported)
+
+
+init_db()
 
 
 def ensure_header() -> None:
@@ -135,58 +221,132 @@ def parse_balance_embed(embed: discord.Embed):
 def last_win_strength(player: str) -> str:
     """Estime la probabilite du poulet actuel du joueur: chaque poulet neuf
     (achete apres une Defaite, qui le tue toujours) repart a 50%, et ne
-    remonte que lorsqu'une Victoire confirme le palier suivant."""
-    values = _sheet.get_all_values()
-    rows = [row for row in values[1:] if len(row) > 4 and row[1] == player and row[0]]
-    if not rows:
+    remonte que lorsqu'une Victoire confirme le palier suivant. Lit SQLite
+    (toujours a jour, y compris les lignes pas encore synchronisees vers
+    Sheets) plutot que la feuille Stats elle-meme."""
+    row = _db.execute(
+        "SELECT result, strength FROM stats WHERE player = ? ORDER BY timestamp DESC LIMIT 1",
+        (player,),
+    ).fetchone()
+    if row is None:
         return "50"
-    latest = max(rows, key=lambda row: datetime.fromisoformat(row[0]))
-    if latest[2] == "Victoire" and latest[4].isdigit():
-        return str(int(latest[4]) + 1)
+    result, strength = row
+    if result == "Victoire" and strength.isdigit():
+        return str(int(strength) + 1)
     return "50"
 
 
-def update_overview(force: bool = False) -> None:
-    """Recalcule la feuille Overview (une ligne par joueur + une ligne 'Total')
-    a partir de l'ensemble des lignes de la feuille principale. Regroupe par ID
-    Discord (colonne H de la feuille principale) plutot que par pseudo affiche,
-    car deux joueurs differents peuvent partager le meme pseudo/surnom sur un
-    serveur - les lignes anterieures a l'ajout de cette colonne (sans ID) se
-    replient sur un regroupement par pseudo, corrige des qu'un /backfill est
-    relance pour leur retro-attribuer un ID.
-
-    force=True (utilise par run_backfill(), qui n'appelle cette fonction
-    qu'une seule fois en toute fin de rescan) court-circuite le debounce
-    OVERVIEW_MIN_INTERVAL - un admin qui lance /backfill attend un resultat
-    immediat, pas une mise a jour potentiellement differee."""
-    global _last_overview_update
-    now = time.monotonic()
-    if not force and now - _last_overview_update < OVERVIEW_MIN_INTERVAL:
-        return
-
+def sync_to_sheets() -> None:
+    """Pousse vers Sheets tout ce qui est en attente en local (appelee par la
+    boucle periodique sync_loop, et une fois de plus hors-cadence a la fin de
+    run_backfill() pour un retour immediat). Chaque etape est isolee: l'echec
+    d'une des trois ne bloque pas les autres, et les lignes concernees restent
+    simplement non-synchronisees pour etre retentees au prochain appel - pas
+    de perte possible, juste un delai."""
+    try:
+        _flush_stats()
+    except gspread.exceptions.APIError:
+        log.exception("Echec de synchronisation de Stats vers Sheets (quota Sheets API ?)")
+    try:
+        _flush_bank()
+    except gspread.exceptions.APIError:
+        log.exception("Echec de synchronisation de Bank vers Sheets (quota Sheets API ?)")
     try:
         _update_overview_impl()
     except gspread.exceptions.APIError:
-        # Ne pas avancer _last_overview_update: on retente au prochain appel
-        # au lieu de rester bloque pendant tout OVERVIEW_MIN_INTERVAL.
         log.exception("Echec de la mise a jour d'Overview (quota Sheets API ?)")
+
+
+def _flush_stats() -> None:
+    """Pousse les lignes stats non synchronisees vers la feuille Stats. Une
+    ligne deja presente sur Sheets (sheet_row connu - typiquement une
+    correction de /backfill) est corrigee sur place via batch_update plutot
+    que re-ajoutee, pour ne jamais dupliquer une ligne existante."""
+    to_correct = _db.execute(
+        "SELECT rowid, message_id, timestamp, player, result, gain, strength, server, player_id, sheet_row "
+        "FROM stats WHERE synced = 0 AND sheet_row IS NOT NULL ORDER BY rowid"
+    ).fetchall()
+    to_append = _db.execute(
+        "SELECT rowid, message_id, timestamp, player, result, gain, strength, server, player_id "
+        "FROM stats WHERE synced = 0 AND sheet_row IS NULL ORDER BY rowid"
+    ).fetchall()
+
+    if not to_correct and not to_append:
         return
 
-    _last_overview_update = now
+    if to_correct:
+        updates = [
+            {
+                "range": f"A{sheet_row}:H{sheet_row}",
+                "values": [[timestamp, player, result, gain, strength, message_id, server, player_id]],
+            }
+            for _rowid, message_id, timestamp, player, result, gain, strength, server, player_id, sheet_row in to_correct
+        ]
+        _sheet.batch_update(updates, value_input_option="USER_ENTERED")
+        _db.executemany("UPDATE stats SET synced = 1 WHERE rowid = ?", [(r[0],) for r in to_correct])
+        _db.commit()
+        log.info("%d ligne(s) Stats corrigee(s) sur Sheets.", len(to_correct))
+
+    if to_append:
+        values = [
+            [timestamp, player, result, gain, strength, message_id, server, player_id]
+            for _rowid, message_id, timestamp, player, result, gain, strength, server, player_id in to_append
+        ]
+        response = _sheet.append_rows(values, value_input_option="USER_ENTERED")
+        start_row = _first_appended_row(response)
+        for offset, row in enumerate(to_append):
+            rowid = row[0]
+            _db.execute("UPDATE stats SET synced = 1, sheet_row = ? WHERE rowid = ?", (start_row + offset, rowid))
+        _db.commit()
+        log.info("%d ligne(s) Stats ajoutee(s) sur Sheets.", len(to_append))
+
+
+def _first_appended_row(append_response: dict) -> int:
+    updated_range = append_response["updates"]["updatedRange"]
+    match = APPEND_ROW_RE.search(updated_range)
+    return int(match.group(1))
+
+
+def _flush_bank() -> None:
+    """Pousse les lignes bank non synchronisees. Pas de notion de correction
+    ici (Bank est temps-reel uniquement, pas couvert par /backfill), donc
+    toujours un simple ajout."""
+    rows = _db.execute(
+        "SELECT rowid, message_id, timestamp, player, cash, banque, total, server "
+        "FROM bank WHERE synced = 0 ORDER BY rowid"
+    ).fetchall()
+    if not rows:
+        return
+
+    values = [
+        [timestamp, player, cash, banque, total, message_id, server]
+        for _rowid, message_id, timestamp, player, cash, banque, total, server in rows
+    ]
+    _bank_sheet.append_rows(values, value_input_option="USER_ENTERED")
+    _db.executemany("UPDATE bank SET synced = 1 WHERE rowid = ?", [(r[0],) for r in rows])
+    _db.commit()
+    log.info("%d ligne(s) Bank ajoutee(s) sur Sheets.", len(rows))
 
 
 def _update_overview_impl() -> None:
+    """Recalcule la feuille Overview (une ligne par joueur + une ligne 'Total')
+    a partir de l'ensemble des lignes de la table SQLite stats (source de
+    verite - toujours a jour, contrairement a une lecture de la feuille Sheets
+    qui ne refleterait que ce qui a deja ete synchronise). Regroupe par ID
+    Discord (colonne player_id) plutot que par pseudo affiche, car deux
+    joueurs differents peuvent partager le meme pseudo/surnom sur un serveur -
+    les lignes sans ID (anterieures a son ajout) se replient sur un
+    regroupement par pseudo, corrige des qu'un /backfill est relance pour leur
+    retro-attribuer un ID."""
     stats: dict[str, dict[str, int]] = {}
     names: dict[str, str] = {"total": "Total"}
 
     def entry(key: str) -> dict[str, int]:
         return stats.setdefault(key, {"total": 0, "defeats": 0, "wins": 0, "best_percent": 0, "profit": 0})
 
-    for row in _sheet.get_all_values()[1:]:
-        if len(row) < 4:
-            continue
-        player, result, gain = row[1], row[2], row[3]
-        player_id = row[7] if len(row) > 7 and row[7] else ""
+    for player, result, gain, strength, player_id in _db.execute(
+        "SELECT player, result, gain, strength, player_id FROM stats"
+    ):
         key = f"id:{player_id}" if player_id else f"name:{player.lower()}"
         names[key] = player
 
@@ -199,8 +359,8 @@ def _update_overview_impl() -> None:
                 data["defeats"] += 1
             if gain.lstrip("-").isdigit():
                 data["profit"] += int(gain)
-            if result == "Victoire" and len(row) > 4 and row[4].isdigit():
-                data["best_percent"] = max(data["best_percent"], int(row[4]))
+            if result == "Victoire" and strength.isdigit():
+                data["best_percent"] = max(data["best_percent"], int(strength))
 
     overview_rows = _overview_sheet.get_all_values()
     existing_by_id = {row[7]: i for i, row in enumerate(overview_rows, start=1) if i > 1 and len(row) > 7 and row[7]}
@@ -268,11 +428,6 @@ async def find_command_info(message: discord.Message, player: str) -> tuple[str,
     return "", None
 
 
-def _existing_rows() -> dict[str, int]:
-    values = _sheet.get_all_values()
-    return {row[5]: i for i, row in enumerate(values, start=1) if i > 1 and len(row) > 5 and row[5]}
-
-
 def _watched_channels(client: discord.Client) -> list[discord.TextChannel]:
     if WATCH_CHANNEL_ID:
         channel = client.get_channel(WATCH_CHANNEL_ID)
@@ -307,17 +462,18 @@ async def _channel_group(channel: discord.TextChannel) -> list[discord.abc.Messa
 async def run_backfill(client: discord.Client) -> tuple[int, int]:
     """Rescanne l'historique des salons surveilles (et leurs fils) pour corriger
     les lignes existantes (Resultat/Gain/Probabilite) et ajouter les combats jamais
-    logues. Retourne (lignes corrigees, lignes ajoutees)."""
+    logues, dans SQLite (source de verite). Declenche ensuite un sync_to_sheets()
+    immediat pour que l'admin voie le resultat tout de suite. Retourne
+    (lignes corrigees, lignes ajoutees)."""
     ensure_header()
-    existing = _existing_rows()
+    existing_ids = {row[0] for row in _db.execute("SELECT message_id FROM stats")}
     channels = _watched_channels(client)
     if not channels:
         log.warning("Aucun salon accessible trouve.")
         return 0, 0
 
-    updates = []
-    corrected_rows: set[int] = set()
-    new_rows = []
+    corrected = 0
+    added = 0
     last_win_percent: dict[str, str] = {}
     last_progress = time.monotonic()
 
@@ -381,47 +537,49 @@ async def run_backfill(client: discord.Client) -> tuple[int, int]:
                 timestamp = message.created_at.astimezone(TIMEZONE).isoformat(timespec="seconds")
                 id_value = str(player_id) if player_id else ""
 
-                if msg_id in existing:
-                    row = existing[msg_id]
-                    corrected_rows.add(row)
-                    updates.append({"range": f"A{row}", "values": [[timestamp]]})
-                    updates.append({"range": f"C{row}:E{row}", "values": [[result, gain, strength]]})
-                    updates.append({"range": f"G{row}:H{row}", "values": [[server, id_value]]})
+                if msg_id in existing_ids:
+                    corrected += 1
                 else:
-                    new_rows.append([timestamp, player, result, gain, strength, msg_id, server, id_value])
+                    added += 1
 
-    if updates:
-        _sheet.batch_update(updates, value_input_option="USER_ENTERED")
-        log.info("%d ligne(s) corrigee(s).", len(corrected_rows))
+                # ON CONFLICT ne touche pas sheet_row: une correction garde la
+                # ligne Sheets qu'elle a deja (repoussee en place par
+                # _flush_stats()), un ajout part de sheet_row=NULL (nouvelle
+                # ligne Sheets a la prochaine synchro).
+                _db.execute(
+                    "INSERT INTO stats (message_id, timestamp, player, result, gain, strength, server, player_id, synced) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0) "
+                    "ON CONFLICT(message_id) DO UPDATE SET "
+                    "timestamp=excluded.timestamp, player=excluded.player, result=excluded.result, "
+                    "gain=excluded.gain, strength=excluded.strength, server=excluded.server, "
+                    "player_id=excluded.player_id, synced=0",
+                    (msg_id, timestamp, player, result, gain, strength, server, id_value),
+                )
+
+    _db.commit()
+    if corrected or added:
+        log.info("%d ligne(s) corrigee(s), %d ligne(s) ajoutee(s) (SQLite).", corrected, added)
+        sync_to_sheets()
     else:
-        log.info("Aucune ligne a corriger.")
+        log.info("Aucune ligne a corriger ou ajouter.")
 
-    if new_rows:
-        _sheet.append_rows(new_rows, value_input_option="USER_ENTERED")
-        log.info("%d ligne(s) ajoutee(s).", len(new_rows))
-    else:
-        log.info("Aucune nouvelle ligne a ajouter.")
-
-    if updates or new_rows:
-        update_overview(force=True)
-
-    return len(corrected_rows), len(new_rows)
+    return corrected, added
 
 
 def build_stats_embed(server: str) -> discord.Embed:
-    rows = [row for row in _sheet.get_all_values()[1:] if len(row) > 6 and row[6] == server]
-    wins = [row for row in rows if row[2] == "Victoire"]
-    losses = [row for row in rows if row[2] == "Defaite"]
+    rows = _db.execute("SELECT player, result, strength FROM stats WHERE server = ?", (server,)).fetchall()
+    wins = [row for row in rows if row[1] == "Victoire"]
+    losses = [row for row in rows if row[1] == "Defaite"]
 
-    total_counts = Counter(row[1] for row in rows)
-    win_counts = Counter(row[1] for row in wins)
+    total_counts = Counter(row[0] for row in rows)
+    win_counts = Counter(row[0] for row in wins)
     winrates = {player: win_counts[player] / total * 100 for player, total in total_counts.items()}
     best_winrate = max(winrates.items(), key=lambda item: item[1], default=None)
     worst_winrate = min(winrates.items(), key=lambda item: item[1], default=None)
 
     highest_prob_win = max(
-        (row for row in wins if len(row) > 4 and row[4].isdigit()),
-        key=lambda row: int(row[4]),
+        (row for row in wins if row[2].isdigit()),
+        key=lambda row: int(row[2]),
         default=None,
     )
 
@@ -441,7 +599,7 @@ def build_stats_embed(server: str) -> discord.Embed:
     )
     embed.add_field(
         name="Poulet a la plus haute probabilite",
-        value=f"{highest_prob_win[1]} ({highest_prob_win[4]}%)" if highest_prob_win else "Aucun",
+        value=f"{highest_prob_win[0]} ({highest_prob_win[2]}%)" if highest_prob_win else "Aucun",
         inline=False,
     )
     return embed
@@ -453,6 +611,11 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 _backfill_lock = asyncio.Lock()
 
 
+@tasks.loop(seconds=SYNC_INTERVAL)
+async def sync_loop():
+    sync_to_sheets()
+
+
 async def _sync_guild_commands(guild: discord.Guild) -> None:
     bot.tree.copy_global_to(guild=guild)
     await bot.tree.sync(guild=guild)
@@ -461,6 +624,8 @@ async def _sync_guild_commands(guild: discord.Guild) -> None:
 @bot.event
 async def on_ready():
     ensure_header()
+    if not sync_loop.is_running():
+        sync_loop.start()
     global tracked_usernames
     tracked_usernames = set()
     for user_id in TRACKED_MEMBER_IDS:
@@ -556,10 +721,12 @@ async def on_message(message: discord.Message):
                     player, cash, bank_amount, total = balance
                     timestamp = message.created_at.astimezone(TIMEZONE).isoformat(timespec="seconds")
                     server = message.guild.name if message.guild else ""
-                    _bank_sheet.append_row(
-                        [timestamp, player, cash, bank_amount, total, str(message.id), server],
-                        value_input_option="USER_ENTERED",
+                    _db.execute(
+                        "INSERT OR IGNORE INTO bank (message_id, timestamp, player, cash, banque, total, server, synced) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+                        (str(message.id), timestamp, player, cash, bank_amount, total, server),
                     )
+                    _db.commit()
                     log.info("Bank: %s - cash=%s banque=%s total=%s", player, cash, bank_amount, total)
             continue
 
@@ -575,11 +742,16 @@ async def on_message(message: discord.Message):
         timestamp = message.created_at.astimezone(TIMEZONE).isoformat(timespec="seconds")
         server = message.guild.name if message.guild else ""
 
-        _sheet.append_row(
-            [timestamp, player, result, gain, strength, str(message.id), server, str(player_id) if player_id else ""],
-            value_input_option="USER_ENTERED",
+        # Ecriture locale uniquement ici (fiable, pas de reseau) - la boucle
+        # sync_loop se charge de pousser vers Sheets par lots. C'est ce qui
+        # evite qu'un hoquet reseau/quota Sheets ne fasse disparaitre un combat:
+        # avant, ce append_row direct vers Sheets n'avait aucun retry.
+        _db.execute(
+            "INSERT OR IGNORE INTO stats (message_id, timestamp, player, result, gain, strength, server, player_id, synced) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            (str(message.id), timestamp, player, result, gain, strength, server, str(player_id) if player_id else ""),
         )
-        update_overview()
+        _db.commit()
         log.info("%s - %s - gain=%s - force=%s%%", player, result, gain, strength)
 
 

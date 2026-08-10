@@ -4,11 +4,12 @@ Bot Discord qui surveille les résultats de cockfight d'UnbelievaBoat et les jou
 
 ## Fonctionnalités
 
-- **Journalisation en temps réel** : chaque victoire/défaite de cockfight postée par UnbelievaBoat est parsée et ajoutée comme ligne dans la feuille `Cockfights` (joueur, résultat, gain, probabilité, horodatage, serveur).
+- **Journalisation en temps réel, fiable même si Sheets est indisponible** : chaque victoire/défaite de cockfight postée par UnbelievaBoat est parsée et écrite immédiatement dans une base SQLite locale (`DB_PATH`), puis synchronisée vers la feuille `Cockfights` par lots toutes les `SYNC_INTERVAL` secondes. Un combat n'est donc jamais perdu à cause d'un quota ou d'un hoquet réseau côté Google Sheets — au pire il apparaît sur la feuille avec un léger délai.
 - **`/backfill`** (réservée aux administrateurs) : rescanne tout l'historique du salon surveillé (et de ses fils, actifs et archivés) pour corriger les lignes déjà loguées et ajouter celles qui manquent. Utile après une correction de bug de parsing ou une coupure du bot.
 - **`/stats`** : affiche un embed avec les statistiques du serveur (combats, victoires, défaites, meilleur/pire winrate, poulet obtenu à la plus haute probabilité).
-- **Feuille `Overview`** : une ligne par joueur (+ une ligne `Total`) avec Total / Défaites / Victoires / Winrate / Meilleur poulet / Rentabilité / ID Joueur, recalculée automatiquement à chaque combat logué et après chaque backfill. Regroupée par ID Discord (pas par pseudo affiché) pour éviter de fusionner deux membres qui partagent le même pseudo/surnom — les lignes créées avant l'ajout de cette colonne sont corrigées au prochain `/backfill`.
-- **Feuille `Bank`** : journalise en temps réel chaque `+bal` observé dans le salon surveillé (par n'importe qui, pas seulement les joueurs suivis) concernant un membre listé dans `TRACKED_MEMBER_IDS` (joueur, cash, banque, total, horodatage, serveur). Écoute passive uniquement — le bot n'envoie jamais `+bal` lui-même. Non couvert par `/backfill` (temps réel uniquement).
+- **Feuille `Overview`** : une ligne par joueur (+ une ligne `Total`) avec Total / Défaites / Victoires / Winrate / Meilleur poulet / Rentabilité / ID Joueur, recalculée à partir de SQLite à chaque synchronisation périodique et après chaque backfill. Regroupée par ID Discord (pas par pseudo affiché) pour éviter de fusionner deux membres qui partagent le même pseudo/surnom — les lignes créées avant l'ajout de cette colonne sont corrigées au prochain `/backfill`.
+- **Feuille `Bank`** : journalise (même mécanisme SQLite + synchronisation par lots que `Cockfights`) chaque `+bal` observé dans le salon surveillé (par n'importe qui, pas seulement les joueurs suivis) concernant un membre listé dans `TRACKED_MEMBER_IDS` (joueur, cash, banque, total, horodatage, serveur). Écoute passive uniquement — le bot n'envoie jamais `+bal` lui-même. Non couvert par `/backfill` (temps réel uniquement).
+- **Base SQLite locale (`DB_PATH`, défaut `bot.db`)** : source de vérité pour `Cockfights` et `Bank`. Au premier démarrage (fichier neuf/vide), l'historique déjà présent sur les feuilles Sheets est importé une fois pour ne rien perdre. Ensuite, `on_message` n'écrit plus que dans SQLite (rapide, local, ~jamais en échec) ; une tâche périodique pousse les lignes en attente vers Sheets par lots, avec retry naturel — une ligne non synchronisée le reste simplement jusqu'au prochain cycle, rien n'est jamais perdu, seulement retardé. **Important en déploiement conteneurisé (Coolify, Docker...)** : `DB_PATH` doit pointer vers un volume persistant, sinon le fichier est effacé à chaque redéploiement et ne protège plus que contre un simple crash/redémarrage du process.
 
 ## Prérequis
 
@@ -41,7 +42,8 @@ Toutes les variables sont documentées dans [.env.example](.env.example) et char
 | `TIMEZONE` | non (défaut `Europe/Paris`) | Fuseau IANA utilisé pour l'Horodatage, indépendant du fuseau système de la machine qui héberge le bot. |
 | `BANK_SHEET_TAB` | non (défaut `Bank`) | Onglet des balances suivies, doit déjà exister. |
 | `TRACKED_MEMBER_IDS` | non | IDs Discord séparés par des virgules des membres dont les `+bal` doivent être journalisés dans `Bank`. Vide = suivi désactivé. |
-| `OVERVIEW_MIN_INTERVAL` | non (défaut `20`) | Intervalle minimum en secondes entre deux recalculs complets de la feuille `Overview`. |
+| `DB_PATH` | non (défaut `bot.db`) | Chemin du fichier SQLite, source de vérité pour `Cockfights`/`Bank`. **Doit être sur un volume persistant en déploiement conteneurisé.** |
+| `SYNC_INTERVAL` | non (défaut `15`) | Intervalle en secondes entre deux synchronisations SQLite → Sheets (Stats, Bank, Overview). |
 
 ### Créer le bot Discord
 
@@ -72,6 +74,8 @@ Réutilise la configuration et la logique de `bot.py` (`run_backfill()`). Néces
 ## Déploiement
 
 Un `Dockerfile` est fourni (image `python:3.12-slim`). En déploiement (ex. Coolify), utiliser `GOOGLE_CREDENTIALS_JSON` plutôt que de fournir un fichier de credentials.
+
+**Monter un volume persistant sur `DB_PATH`** (ex. `/app/data/bot.db`, avec `DB_PATH=/app/data/bot.db`) est indispensable : le `Dockerfile` ne déclare aucun volume, donc sans un volume monté explicitement dans la config de la plateforme, un redéploiement recrée le conteneur et efface le fichier SQLite — la base se re-bootstrape alors depuis Sheets (pas de perte de données déjà loguées), mais les lignes pas encore synchronisées au moment du redéploiement, elles, seraient perdues.
 
 ## Notes
 
