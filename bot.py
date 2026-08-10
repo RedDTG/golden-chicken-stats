@@ -362,6 +362,33 @@ def _update_overview_impl() -> None:
             if result == "Victoire" and strength.isdigit():
                 data["best_percent"] = max(data["best_percent"], int(strength))
 
+    # Fusionne chaque bucket "name:" (lignes sans ID - anterieures a son ajout,
+    # ou un +cf que find_command_info n'a pas retrouve) dans le bucket "id:"
+    # du meme joueur des qu'un ID est connu pour ce pseudo. Sans ca, les deux
+    # buckets restent des cles separees ci-dessous et se disputent la meme
+    # ligne Overview existante (meme pseudo) via le repli par nom: la
+    # deuxieme a s'y presenter est bloquee par claimed_name_rows et part sur
+    # une toute nouvelle ligne - deux lignes "cheval_2_3" au lieu d'une, dont
+    # une ne recoit plus jamais les combats nouvellement ID-tagged (figee).
+    # VLOOKUP/QUERY sur les feuilles "User monitor" trouvent alors la
+    # premiere des deux, potentiellement perimee. Vecu en prod: 4 joueurs
+    # concernes des le premier cycle post-migration SQLite.
+    name_to_id_key: dict[str, str] = {}
+    for key in stats:
+        if key.startswith("id:"):
+            name_to_id_key.setdefault(names[key].lower(), key)
+
+    for key in [k for k in stats if k.startswith("name:")]:
+        target_key = name_to_id_key.get(key[len("name:"):])
+        if target_key is None:
+            continue
+        source = stats.pop(key)
+        target = entry(target_key)
+        for field in ("total", "defeats", "wins", "profit"):
+            target[field] += source[field]
+        target["best_percent"] = max(target["best_percent"], source["best_percent"])
+        del names[key]
+
     overview_rows = _overview_sheet.get_all_values()
     existing_by_id = {row[7]: i for i, row in enumerate(overview_rows, start=1) if i > 1 and len(row) > 7 and row[7]}
     existing_by_name = {row[0]: i for i, row in enumerate(overview_rows, start=1) if i > 1 and row and row[0]}
