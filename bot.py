@@ -53,6 +53,18 @@ BANK_HEADER = ["Horodatage", "Joueur", "Cash", "Banque", "Total", "Message ID", 
 # en pseudos une fois au demarrage pour pouvoir matcher par nom ensuite.
 tracked_usernames: set[str] = set()
 
+# update_overview() re-reads the *entire* Stats sheet (13000+ rows and
+# growing) plus the Overview sheet on every single call. Called after every
+# real-time log, that's one full-sheet Sheets-API read pair per cockfight
+# result - with two players farming every few seconds this burns through the
+# Sheets API's per-100s quota fast enough that update_overview() starts
+# throwing (silently, since nothing upstream catches it) and Overview freezes
+# indefinitely. Debounce it: skip a call if the last successful one was too
+# recent: the next real fight naturally triggers a fresh full recompute, so
+# no update is ever permanently lost, just delayed by at most this many seconds.
+OVERVIEW_MIN_INTERVAL = float(os.environ.get("OVERVIEW_MIN_INTERVAL", "20"))
+_last_overview_update = 0.0
+
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 if GOOGLE_CREDENTIALS_JSON:
     _creds = Credentials.from_service_account_info(json.loads(GOOGLE_CREDENTIALS_JSON), scopes=SCOPES)
@@ -134,14 +146,36 @@ def last_win_strength(player: str) -> str:
     return "50"
 
 
-def update_overview() -> None:
+def update_overview(force: bool = False) -> None:
     """Recalcule la feuille Overview (une ligne par joueur + une ligne 'Total')
     a partir de l'ensemble des lignes de la feuille principale. Regroupe par ID
     Discord (colonne H de la feuille principale) plutot que par pseudo affiche,
     car deux joueurs differents peuvent partager le meme pseudo/surnom sur un
     serveur - les lignes anterieures a l'ajout de cette colonne (sans ID) se
     replient sur un regroupement par pseudo, corrige des qu'un /backfill est
-    relance pour leur retro-attribuer un ID."""
+    relance pour leur retro-attribuer un ID.
+
+    force=True (utilise par run_backfill(), qui n'appelle cette fonction
+    qu'une seule fois en toute fin de rescan) court-circuite le debounce
+    OVERVIEW_MIN_INTERVAL - un admin qui lance /backfill attend un resultat
+    immediat, pas une mise a jour potentiellement differee."""
+    global _last_overview_update
+    now = time.monotonic()
+    if not force and now - _last_overview_update < OVERVIEW_MIN_INTERVAL:
+        return
+
+    try:
+        _update_overview_impl()
+    except gspread.exceptions.APIError:
+        # Ne pas avancer _last_overview_update: on retente au prochain appel
+        # au lieu de rester bloque pendant tout OVERVIEW_MIN_INTERVAL.
+        log.exception("Echec de la mise a jour d'Overview (quota Sheets API ?)")
+        return
+
+    _last_overview_update = now
+
+
+def _update_overview_impl() -> None:
     stats: dict[str, dict[str, int]] = {}
     names: dict[str, str] = {"total": "Total"}
 
@@ -369,7 +403,7 @@ async def run_backfill(client: discord.Client) -> tuple[int, int]:
         log.info("Aucune nouvelle ligne a ajouter.")
 
     if updates or new_rows:
-        update_overview()
+        update_overview(force=True)
 
     return len(corrected_rows), len(new_rows)
 

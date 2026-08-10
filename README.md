@@ -41,6 +41,7 @@ Toutes les variables sont documentées dans [.env.example](.env.example) et char
 | `TIMEZONE` | non (défaut `Europe/Paris`) | Fuseau IANA utilisé pour l'Horodatage, indépendant du fuseau système de la machine qui héberge le bot. |
 | `BANK_SHEET_TAB` | non (défaut `Bank`) | Onglet des balances suivies, doit déjà exister. |
 | `TRACKED_MEMBER_IDS` | non | IDs Discord séparés par des virgules des membres dont les `+bal` doivent être journalisés dans `Bank`. Vide = suivi désactivé. |
+| `OVERVIEW_MIN_INTERVAL` | non (défaut `20`) | Intervalle minimum en secondes entre deux recalculs complets de la feuille `Overview`. |
 
 ### Créer le bot Discord
 
