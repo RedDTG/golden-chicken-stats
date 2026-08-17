@@ -170,13 +170,17 @@ def _bootstrap_from_sheets() -> None:
 init_db()
 
 
-def ensure_header() -> None:
-    if _sheet.row_values(1) != HEADER:
-        _sheet.update("A1", [HEADER])
-    if _overview_sheet.row_values(1) != OVERVIEW_HEADER:
-        _overview_sheet.update("A1", [OVERVIEW_HEADER])
-    if _bank_sheet.row_values(1) != BANK_HEADER:
-        _bank_sheet.update("A1", [BANK_HEADER])
+async def ensure_header() -> None:
+    """gspread est synchrone (requests bloquant) - chaque appel est deporte
+    dans un thread via asyncio.to_thread pour ne jamais geler la boucle
+    asyncio pendant un aller-retour reseau vers Sheets (voir sync_to_sheets()
+    pour le meme raisonnement, plus critique encore vu sa cadence)."""
+    if await asyncio.to_thread(_sheet.row_values, 1) != HEADER:
+        await asyncio.to_thread(_sheet.update, "A1", [HEADER])
+    if await asyncio.to_thread(_overview_sheet.row_values, 1) != OVERVIEW_HEADER:
+        await asyncio.to_thread(_overview_sheet.update, "A1", [OVERVIEW_HEADER])
+    if await asyncio.to_thread(_bank_sheet.row_values, 1) != BANK_HEADER:
+        await asyncio.to_thread(_bank_sheet.update, "A1", [BANK_HEADER])
 
 
 def parse_cockfight_embed(embed: discord.Embed):
@@ -297,7 +301,7 @@ async def _maybe_announce_record(message: discord.Message, player: str, server: 
         log.exception("Echec de l'annonce du nouveau record dans le salon %d", RECORD_CHANNEL_ID)
 
 
-def sync_to_sheets() -> None:
+async def sync_to_sheets() -> None:
     """Pousse vers Sheets tout ce qui est en attente en local (appelee par la
     boucle periodique sync_loop, et une fois de plus hors-cadence a la fin de
     run_backfill() pour un retour immediat). Chaque etape est isolee: l'echec
@@ -305,24 +309,33 @@ def sync_to_sheets() -> None:
     simplement non-synchronisees pour etre retentees au prochain appel - pas
     de perte possible, juste un delai."""
     try:
-        _flush_stats()
+        await _flush_stats()
     except gspread.exceptions.APIError:
         log.exception("Echec de synchronisation de Stats vers Sheets (quota Sheets API ?)")
     try:
-        _flush_bank()
+        await _flush_bank()
     except gspread.exceptions.APIError:
         log.exception("Echec de synchronisation de Bank vers Sheets (quota Sheets API ?)")
     try:
-        _update_overview_impl()
+        await _update_overview_impl()
     except gspread.exceptions.APIError:
         log.exception("Echec de la mise a jour d'Overview (quota Sheets API ?)")
 
 
-def _flush_stats() -> None:
+async def _flush_stats() -> None:
     """Pousse les lignes stats non synchronisees vers la feuille Stats. Une
     ligne deja presente sur Sheets (sheet_row connu - typiquement une
     correction de /backfill) est corrigee sur place via batch_update plutot
-    que re-ajoutee, pour ne jamais dupliquer une ligne existante."""
+    que re-ajoutee, pour ne jamais dupliquer une ligne existante.
+
+    Les lectures/ecritures SQLite restent synchrones sur le thread principal
+    (rapides, locales) ; seuls les appels reseau gspread (batch_update/
+    append_rows, potentiellement plusieurs centaines de ms a quelques
+    secondes) sont deportes via asyncio.to_thread. Sans ca, ces appels
+    bloquent toute la boucle asyncio pendant leur duree - vecu en prod: une
+    interaction Discord (/audit) arrivee pendant un batch_update a expire
+    (>3s) avant meme que defer() ait pu s'executer, avec un "Unknown
+    interaction" en consequence."""
     to_correct = _db.execute(
         "SELECT rowid, message_id, timestamp, player, result, gain, strength, server, player_id, sheet_row "
         "FROM stats WHERE synced = 0 AND sheet_row IS NOT NULL ORDER BY rowid"
@@ -343,7 +356,7 @@ def _flush_stats() -> None:
             }
             for _rowid, message_id, timestamp, player, result, gain, strength, server, player_id, sheet_row in to_correct
         ]
-        _sheet.batch_update(updates, value_input_option="USER_ENTERED")
+        await asyncio.to_thread(_sheet.batch_update, updates, value_input_option="USER_ENTERED")
         _db.executemany("UPDATE stats SET synced = 1 WHERE rowid = ?", [(r[0],) for r in to_correct])
         _db.commit()
         log.info("%d ligne(s) Stats corrigee(s) sur Sheets.", len(to_correct))
@@ -353,7 +366,7 @@ def _flush_stats() -> None:
             [timestamp, player, result, gain, strength, message_id, server, player_id]
             for _rowid, message_id, timestamp, player, result, gain, strength, server, player_id in to_append
         ]
-        response = _sheet.append_rows(values, value_input_option="USER_ENTERED")
+        response = await asyncio.to_thread(_sheet.append_rows, values, value_input_option="USER_ENTERED")
         start_row = _first_appended_row(response)
         for offset, row in enumerate(to_append):
             rowid = row[0]
@@ -368,7 +381,7 @@ def _first_appended_row(append_response: dict) -> int:
     return int(match.group(1))
 
 
-def _flush_bank() -> None:
+async def _flush_bank() -> None:
     """Pousse les lignes bank non synchronisees. Pas de notion de correction
     ici (Bank est temps-reel uniquement, pas couvert par /backfill), donc
     toujours un simple ajout."""
@@ -383,13 +396,13 @@ def _flush_bank() -> None:
         [timestamp, player, cash, banque, total, message_id, server]
         for _rowid, message_id, timestamp, player, cash, banque, total, server in rows
     ]
-    _bank_sheet.append_rows(values, value_input_option="USER_ENTERED")
+    await asyncio.to_thread(_bank_sheet.append_rows, values, value_input_option="USER_ENTERED")
     _db.executemany("UPDATE bank SET synced = 1 WHERE rowid = ?", [(r[0],) for r in rows])
     _db.commit()
     log.info("%d ligne(s) Bank ajoutee(s) sur Sheets.", len(rows))
 
 
-def _update_overview_impl() -> None:
+async def _update_overview_impl() -> None:
     """Recalcule la feuille Overview (une ligne par joueur + une ligne 'Total')
     a partir de l'ensemble des lignes de la table SQLite stats (source de
     verite - toujours a jour, contrairement a une lecture de la feuille Sheets
@@ -450,7 +463,7 @@ def _update_overview_impl() -> None:
         target["best_percent"] = max(target["best_percent"], source["best_percent"])
         del names[key]
 
-    overview_rows = _overview_sheet.get_all_values()
+    overview_rows = await asyncio.to_thread(_overview_sheet.get_all_values)
     existing_by_id = {row[7]: i for i, row in enumerate(overview_rows, start=1) if i > 1 and len(row) > 7 and row[7]}
     existing_by_name = {row[0]: i for i, row in enumerate(overview_rows, start=1) if i > 1 and row and row[0]}
     claimed_name_rows: set[int] = set()
@@ -481,9 +494,9 @@ def _update_overview_impl() -> None:
             new_rows.append([display_name, *values])
 
     if updates:
-        _overview_sheet.batch_update(updates, value_input_option="USER_ENTERED")
+        await asyncio.to_thread(_overview_sheet.batch_update, updates, value_input_option="USER_ENTERED")
     if new_rows:
-        _overview_sheet.append_rows(new_rows, value_input_option="USER_ENTERED")
+        await asyncio.to_thread(_overview_sheet.append_rows, new_rows, value_input_option="USER_ENTERED")
 
 
 async def find_command_info(message: discord.Message, player: str) -> tuple[str, int | None]:
@@ -553,7 +566,7 @@ async def run_backfill(client: discord.Client) -> tuple[int, int]:
     logues, dans SQLite (source de verite). Declenche ensuite un sync_to_sheets()
     immediat pour que l'admin voie le resultat tout de suite. Retourne
     (lignes corrigees, lignes ajoutees)."""
-    ensure_header()
+    await ensure_header()
     existing_ids = {row[0] for row in _db.execute("SELECT message_id FROM stats")}
     channels = _watched_channels(client)
     if not channels:
@@ -647,7 +660,7 @@ async def run_backfill(client: discord.Client) -> tuple[int, int]:
     _db.commit()
     if corrected or added:
         log.info("%d ligne(s) corrigee(s), %d ligne(s) ajoutee(s) (SQLite).", corrected, added)
-        sync_to_sheets()
+        await sync_to_sheets()
         _load_best_strength()
     else:
         log.info("Aucune ligne a corriger ou ajouter.")
@@ -744,7 +757,7 @@ _backfill_lock = asyncio.Lock()
 
 @tasks.loop(seconds=SYNC_INTERVAL)
 async def sync_loop():
-    sync_to_sheets()
+    await sync_to_sheets()
 
 
 async def _sync_guild_commands(guild: discord.Guild) -> None:
@@ -754,7 +767,7 @@ async def _sync_guild_commands(guild: discord.Guild) -> None:
 
 @bot.event
 async def on_ready():
-    ensure_header()
+    await ensure_header()
     if not sync_loop.is_running():
         sync_loop.start()
     _load_best_strength()
