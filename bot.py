@@ -694,6 +694,48 @@ def build_stats_embed(server: str) -> discord.Embed:
     return embed
 
 
+def build_audit_embed(server: str) -> discord.Embed:
+    """Etat de SQLite (source de verite) pour ce serveur, interroge directement
+    - pas via la feuille Sheets, qui n'est qu'un miroir synchronise par lots et
+    peut donc etre en retard ou masquer une divergence."""
+    total = _db.execute("SELECT COUNT(*) FROM stats WHERE server = ?", (server,)).fetchone()[0]
+    missing_id = _db.execute(
+        "SELECT COUNT(*) FROM stats WHERE server = ? AND player_id = ''", (server,)
+    ).fetchone()[0]
+    pending_stats = _db.execute(
+        "SELECT COUNT(*) FROM stats WHERE server = ? AND synced = 0", (server,)
+    ).fetchone()[0]
+    pending_bank = _db.execute(
+        "SELECT COUNT(*) FROM bank WHERE server = ? AND synced = 0", (server,)
+    ).fetchone()[0]
+    date_range = _db.execute(
+        "SELECT MIN(timestamp), MAX(timestamp) FROM stats WHERE server = ?", (server,)
+    ).fetchone()
+    top_missing = _db.execute(
+        "SELECT s1.player, COUNT(*) AS missing, "
+        "(SELECT COUNT(*) FROM stats s2 WHERE s2.player = s1.player AND s2.server = s1.server) AS total "
+        "FROM stats s1 WHERE s1.server = ? AND s1.player_id = '' "
+        "GROUP BY s1.player ORDER BY missing DESC LIMIT 5",
+        (server,),
+    ).fetchall()
+
+    embed = discord.Embed(title=f"Audit SQLite - {server}", color=discord.Color.blue())
+    embed.add_field(name="Combats loggues", value=str(total), inline=True)
+    pct = f"{missing_id / total * 100:.1f}%" if total else "0%"
+    embed.add_field(name="Sans ID Joueur", value=f"{missing_id} ({pct})", inline=True)
+    embed.add_field(
+        name="En attente vers Sheets",
+        value=f"{pending_stats} combat(s), {pending_bank} +bal",
+        inline=True,
+    )
+    if date_range and date_range[0]:
+        embed.add_field(name="Periode couverte", value=f"{date_range[0]}\n-> {date_range[1]}", inline=False)
+    if top_missing:
+        lines = "\n".join(f"{player} : {missing}/{total_p}" for player, missing, total_p in top_missing)
+        embed.add_field(name="Top joueurs sans ID", value=lines, inline=False)
+    return embed
+
+
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -788,6 +830,17 @@ async def stats_command(interaction: discord.Interaction):
 
     await interaction.response.defer()
     embed = build_stats_embed(interaction.guild.name)
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="audit", description="Verifie l'etat de la base SQLite (source de verite) pour ce serveur")
+async def audit_command(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("Cette commande doit etre utilisee dans un serveur.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    embed = build_audit_embed(interaction.guild.name)
     await interaction.followup.send(embed=embed)
 
 
