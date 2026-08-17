@@ -5,7 +5,7 @@ Bot Discord qui surveille les résultats de cockfight d'UnbelievaBoat et les jou
 ## Fonctionnalités
 
 - **Journalisation en temps réel, fiable même si Sheets est indisponible** : chaque victoire/défaite de cockfight postée par UnbelievaBoat est parsée et écrite immédiatement dans une base SQLite locale (`DB_PATH`), puis synchronisée vers la feuille `Cockfights` par lots toutes les `SYNC_INTERVAL` secondes. Un combat n'est donc jamais perdu à cause d'un quota ou d'un hoquet réseau côté Google Sheets — au pire il apparaît sur la feuille avec un léger délai.
-- **`/backfill`** (réservée aux administrateurs) : rescanne tout l'historique du salon surveillé (et de ses fils, actifs et archivés) pour corriger les lignes déjà loguées et ajouter celles qui manquent. Utile après une correction de bug de parsing ou une coupure du bot.
+- **`/backfill`** (réservée aux administrateurs) : rescanne tout l'historique du salon surveillé (et de ses fils, actifs et archivés) pour corriger les lignes déjà loguées et ajouter celles qui manquent. Utile après une correction de bug de parsing ou une coupure du bot. Sur un gros historique (plusieurs heures de traitement), sa progression est consultable en direct sur l'onglet `Backfill` (`BACKFILL_SHEET_TAB`) — statut, salon en cours, dernier message traité, compteurs corrigés/ajoutés, horodatage de la dernière mise à jour — sans avoir besoin des logs du process.
 - **`/stats`** : affiche un embed avec les statistiques du serveur (combats, victoires, défaites, meilleur/pire winrate, poulet obtenu à la plus haute probabilité).
 - **`/audit`** : interroge SQLite directement (pas la feuille Sheets) pour vérifier la fiabilité des données — nombre de combats loggués, combien n'ont pas d'`ID Joueur` (avec le détail par joueur), combien de lignes attendent encore d'être synchronisées vers Sheets, et la période couverte.
 - **Feuille `Overview`** : une ligne par joueur (+ une ligne `Total`) avec Total / Défaites / Victoires / Winrate / Meilleur poulet / Rentabilité / ID Joueur, recalculée à partir de SQLite à chaque synchronisation périodique et après chaque backfill. Regroupée par ID Discord (pas par pseudo affiché) pour éviter de fusionner deux membres qui partagent le même pseudo/surnom — les lignes créées avant l'ajout de cette colonne sont corrigées au prochain `/backfill`.
@@ -47,6 +47,8 @@ Toutes les variables sont documentées dans [.env.example](.env.example) et char
 | `DB_PATH` | non (défaut `bot.db`) | Chemin du fichier SQLite, source de vérité pour `Cockfights`/`Bank`. **Doit être sur un volume persistant en déploiement conteneurisé.** |
 | `SYNC_INTERVAL` | non (défaut `15`) | Intervalle en secondes entre deux synchronisations SQLite → Sheets (Stats, Bank, Overview). |
 | `RECORD_CHANNEL_ID` | non | Salon où annoncer (`@everyone`) chaque nouveau record de probabilité de victoire. Vide = désactivé. Le bot doit avoir la permission "Mention @everyone" dans ce salon. |
+| `BACKFILL_SHEET_TAB` | non (défaut `Backfill`) | Onglet de statut de `/backfill`, doit déjà exister. |
+| `BACKFILL_HEARTBEAT_INTERVAL` | non (défaut `30`) | Intervalle minimum en secondes entre deux écritures du statut de `/backfill` sur cet onglet. |
 
 ### Créer le bot Discord
 
@@ -62,7 +64,7 @@ Toutes les variables sont documentées dans [.env.example](.env.example) et char
 3. **IAM et administration > Comptes de service** > créer un compte de service.
 4. Sur ce compte de service, onglet **Clés** > Ajouter une clé > JSON : télécharger le fichier et le placer à l'emplacement pointé par `GOOGLE_CREDENTIALS_FILE` (ou copier son contenu dans `GOOGLE_CREDENTIALS_JSON`).
 5. Partager la Google Sheet cible avec l'adresse e-mail du compte de service (rôle **Éditeur**), sinon le bot ne pourra ni lire ni écrire dedans.
-6. Créer dans la feuille les deux onglets `Cockfights` et `Overview` (les en-têtes sont créés/corrigés automatiquement par le bot au démarrage).
+6. Créer dans la feuille les onglets `Cockfights`, `Overview`, `Bank` et `Backfill` (les en-têtes sont créés/corrigés automatiquement par le bot au démarrage).
 
 ## Backfill manuel
 

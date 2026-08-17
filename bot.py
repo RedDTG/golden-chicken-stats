@@ -6,6 +6,7 @@ import re
 import sqlite3
 import time
 from collections import Counter
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import discord
@@ -28,7 +29,13 @@ GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 GOOGLE_SHEET_TAB = os.environ.get("GOOGLE_SHEET_TAB", "Cockfights")
 OVERVIEW_SHEET_TAB = os.environ.get("OVERVIEW_SHEET_TAB", "Overview")
 BANK_SHEET_TAB = os.environ.get("BANK_SHEET_TAB", "Bank")
+BACKFILL_SHEET_TAB = os.environ.get("BACKFILL_SHEET_TAB", "Backfill")
 TRACKED_MEMBER_IDS = {int(x) for x in os.environ.get("TRACKED_MEMBER_IDS", "").split(",") if x.strip()}
+# Intervalle minimum (secondes) entre deux ecritures du statut de progression
+# de /backfill sur l'onglet BACKFILL_SHEET_TAB - plus large que
+# BACKFILL_PROGRESS_INTERVAL (qui ne fait que logguer) pour ne pas empiler
+# des ecritures Sheets trop frequentes sur un run de plusieurs heures.
+BACKFILL_HEARTBEAT_INTERVAL = float(os.environ.get("BACKFILL_HEARTBEAT_INTERVAL", "30"))
 # Chemin du fichier SQLite qui sert de source de verite pour Stats/Bank (voir
 # init_db()). En deploiement conteneurise (Coolify...), ce chemin DOIT etre
 # sur un volume persistant, sinon il est perdu a chaque redeploiement et la
@@ -56,6 +63,7 @@ APPEND_ROW_RE = re.compile(r"![A-Z]+(\d+)")
 HEADER = ["Horodatage", "Joueur", "Resultat", "Gain", "Probabilite (%)", "Message ID", "Serveur", "ID Joueur"]
 OVERVIEW_HEADER = ["Utilisateur", "Total", "Defaites", "Victoires", "Winrate", "Meilleur poulet", "Rentabilite", "ID Joueur"]
 BANK_HEADER = ["Horodatage", "Joueur", "Cash", "Banque", "Total", "Message ID", "Serveur"]
+BACKFILL_HEADER = ["Statut", "Salon", "Dernier message traite", "Corrigees", "Ajoutees", "Derniere mise a jour"]
 
 # Rempli au demarrage (on_ready) via fetch_user: l'embed +bal d'UnbelievaBoat
 # n'expose pas l'ID Discord, seulement embed.author.name (le pseudo brut, meme
@@ -79,6 +87,7 @@ _gc = gspread.authorize(_creds)
 _sheet = _gc.open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_TAB)
 _overview_sheet = _gc.open_by_key(GOOGLE_SHEET_ID).worksheet(OVERVIEW_SHEET_TAB)
 _bank_sheet = _gc.open_by_key(GOOGLE_SHEET_ID).worksheet(BANK_SHEET_TAB)
+_backfill_sheet = _gc.open_by_key(GOOGLE_SHEET_ID).worksheet(BACKFILL_SHEET_TAB)
 
 # sqlite3 sur un fichier local: le bot tourne entierement sur un seul thread
 # (la boucle asyncio), donc une connexion partagee sans check_same_thread est
@@ -181,6 +190,8 @@ async def ensure_header() -> None:
         await asyncio.to_thread(_overview_sheet.update, "A1", [OVERVIEW_HEADER])
     if await asyncio.to_thread(_bank_sheet.row_values, 1) != BANK_HEADER:
         await asyncio.to_thread(_bank_sheet.update, "A1", [BANK_HEADER])
+    if await asyncio.to_thread(_backfill_sheet.row_values, 1) != BACKFILL_HEADER:
+        await asyncio.to_thread(_backfill_sheet.update, "A1", [BACKFILL_HEADER])
 
 
 def parse_cockfight_embed(embed: discord.Embed):
@@ -560,6 +571,21 @@ async def _channel_group(channel: discord.TextChannel) -> list[discord.abc.Messa
     return group
 
 
+async def _update_backfill_status(
+    status: str, channel: str = "", message_timestamp: str = "", corrected: int = 0, added: int = 0
+) -> None:
+    """Ecrit l'etat courant d'un /backfill dans l'onglet BACKFILL_SHEET_TAB -
+    consultable a tout moment (par un humain ou par Claude via l'API Sheets)
+    sans acces aux logs du process, utile vu la duree potentielle d'un run
+    complet (plusieurs heures sur un historique de cette taille)."""
+    now = datetime.now(TIMEZONE).isoformat(timespec="seconds")
+    row = [status, channel, message_timestamp, corrected, added, now]
+    try:
+        await asyncio.to_thread(_backfill_sheet.update, "A2:F2", [row], value_input_option="USER_ENTERED")
+    except gspread.exceptions.APIError:
+        log.exception("Echec de l'ecriture du statut de backfill (quota Sheets API ?)")
+
+
 async def run_backfill(client: discord.Client) -> tuple[int, int]:
     """Rescanne l'historique des salons surveilles (et leurs fils) pour corriger
     les lignes existantes (Resultat/Gain/Probabilite) et ajouter les combats jamais
@@ -571,91 +597,101 @@ async def run_backfill(client: discord.Client) -> tuple[int, int]:
     channels = _watched_channels(client)
     if not channels:
         log.warning("Aucun salon accessible trouve.")
+        await _update_backfill_status("Erreur (aucun salon accessible)")
         return 0, 0
 
     corrected = 0
     added = 0
     last_win_percent: dict[str, str] = {}
     last_progress = time.monotonic()
+    last_heartbeat = time.monotonic()
+    await _update_backfill_status("En cours (recuperation)")
 
-    for channel in channels:
-        subchannels = await _channel_group(channel)
-        log.info("Analyse du salon #%s (%d fil(s) inclus)...", channel.name, len(subchannels) - 1)
+    try:
+        for channel in channels:
+            subchannels = await _channel_group(channel)
+            log.info("Analyse du salon #%s (%d fil(s) inclus)...", channel.name, len(subchannels) - 1)
 
-        messages = []
-        for sub in subchannels:
-            async for m in sub.history(limit=None, oldest_first=True):
-                messages.append(m)
+            messages = []
+            for sub in subchannels:
+                async for m in sub.history(limit=None, oldest_first=True):
+                    messages.append(m)
+                    now = time.monotonic()
+                    m_timestamp = m.created_at.astimezone(TIMEZONE).isoformat(timespec="seconds")
+                    if now - last_progress >= PROGRESS_INTERVAL:
+                        log.info("... recuperation: #%s, message du %s", sub.name, m_timestamp)
+                        last_progress = now
+                    if now - last_heartbeat >= BACKFILL_HEARTBEAT_INTERVAL:
+                        await _update_backfill_status("En cours (recuperation)", sub.name, m_timestamp, corrected, added)
+                        last_heartbeat = time.monotonic()
+            messages.sort(key=lambda m: m.id)
+
+            for message in messages:
                 now = time.monotonic()
+                m_timestamp = message.created_at.astimezone(TIMEZONE).isoformat(timespec="seconds")
                 if now - last_progress >= PROGRESS_INTERVAL:
-                    log.info(
-                        "... recuperation: #%s, message du %s",
-                        sub.name,
-                        m.created_at.astimezone(TIMEZONE).isoformat(timespec="seconds"),
-                    )
+                    log.info("... traitement: #%s, message du %s", message.channel.name, m_timestamp)
                     last_progress = now
-        messages.sort(key=lambda m: m.id)
+                if now - last_heartbeat >= BACKFILL_HEARTBEAT_INTERVAL:
+                    await _update_backfill_status(
+                        "En cours (traitement)", message.channel.name, m_timestamp, corrected, added
+                    )
+                    last_heartbeat = time.monotonic()
 
-        for message in messages:
-            now = time.monotonic()
-            if now - last_progress >= PROGRESS_INTERVAL:
-                log.info(
-                    "... traitement: #%s, message du %s",
-                    message.channel.name,
-                    message.created_at.astimezone(TIMEZONE).isoformat(timespec="seconds"),
-                )
-                last_progress = now
-
-            if not message.author.bot:
-                continue
-            if UNBELIEVABOAT_ID and message.author.id != UNBELIEVABOAT_ID:
-                continue
-            if not message.embeds:
-                continue
-
-            for embed in message.embeds:
-                parsed = parse_cockfight_embed(embed)
-                if parsed is None:
+                if not message.author.bot:
+                    continue
+                if UNBELIEVABOAT_ID and message.author.id != UNBELIEVABOAT_ID:
+                    continue
+                if not message.embeds:
                     continue
 
-                player, result, gain, strength = parsed
-                bet, player_id = await find_command_info(message, player)
+                for embed in message.embeds:
+                    parsed = parse_cockfight_embed(embed)
+                    if parsed is None:
+                        continue
 
-                if result == "Victoire" and strength:
-                    last_win_percent[player] = strength
+                    player, result, gain, strength = parsed
+                    bet, player_id = await find_command_info(message, player)
 
-                if result == "Defaite":
-                    if bet:
-                        gain = f"-{bet}"
-                    if not strength:
-                        strength = str(int(last_win_percent[player]) + 1) if player in last_win_percent else "50"
-                    # Une Defaite tue toujours le poulet: le suivant reparaitra a 50%
-                    # tant qu'aucune nouvelle Victoire ne confirme un palier plus haut.
-                    last_win_percent[player] = "49"
+                    if result == "Victoire" and strength:
+                        last_win_percent[player] = strength
 
-                msg_id = str(message.id)
-                server = message.guild.name if message.guild else ""
-                timestamp = message.created_at.astimezone(TIMEZONE).isoformat(timespec="seconds")
-                id_value = str(player_id) if player_id else ""
+                    if result == "Defaite":
+                        if bet:
+                            gain = f"-{bet}"
+                        if not strength:
+                            strength = str(int(last_win_percent[player]) + 1) if player in last_win_percent else "50"
+                        # Une Defaite tue toujours le poulet: le suivant reparaitra a 50%
+                        # tant qu'aucune nouvelle Victoire ne confirme un palier plus haut.
+                        last_win_percent[player] = "49"
 
-                if msg_id in existing_ids:
-                    corrected += 1
-                else:
-                    added += 1
+                    msg_id = str(message.id)
+                    server = message.guild.name if message.guild else ""
+                    timestamp = message.created_at.astimezone(TIMEZONE).isoformat(timespec="seconds")
+                    id_value = str(player_id) if player_id else ""
 
-                # ON CONFLICT ne touche pas sheet_row: une correction garde la
-                # ligne Sheets qu'elle a deja (repoussee en place par
-                # _flush_stats()), un ajout part de sheet_row=NULL (nouvelle
-                # ligne Sheets a la prochaine synchro).
-                _db.execute(
-                    "INSERT INTO stats (message_id, timestamp, player, result, gain, strength, server, player_id, synced) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0) "
-                    "ON CONFLICT(message_id) DO UPDATE SET "
-                    "timestamp=excluded.timestamp, player=excluded.player, result=excluded.result, "
-                    "gain=excluded.gain, strength=excluded.strength, server=excluded.server, "
-                    "player_id=excluded.player_id, synced=0",
-                    (msg_id, timestamp, player, result, gain, strength, server, id_value),
-                )
+                    if msg_id in existing_ids:
+                        corrected += 1
+                    else:
+                        added += 1
+
+                    # ON CONFLICT ne touche pas sheet_row: une correction garde la
+                    # ligne Sheets qu'elle a deja (repoussee en place par
+                    # _flush_stats()), un ajout part de sheet_row=NULL (nouvelle
+                    # ligne Sheets a la prochaine synchro).
+                    _db.execute(
+                        "INSERT INTO stats (message_id, timestamp, player, result, gain, strength, server, player_id, synced) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0) "
+                        "ON CONFLICT(message_id) DO UPDATE SET "
+                        "timestamp=excluded.timestamp, player=excluded.player, result=excluded.result, "
+                        "gain=excluded.gain, strength=excluded.strength, server=excluded.server, "
+                        "player_id=excluded.player_id, synced=0",
+                        (msg_id, timestamp, player, result, gain, strength, server, id_value),
+                    )
+    except Exception:
+        _db.commit()
+        await _update_backfill_status(f"Erreur ({corrected} corrigee(s), {added} ajoutee(s) avant l'echec)")
+        raise
 
     _db.commit()
     if corrected or added:
@@ -665,6 +701,7 @@ async def run_backfill(client: discord.Client) -> tuple[int, int]:
     else:
         log.info("Aucune ligne a corriger ou ajouter.")
 
+    await _update_backfill_status("Termine", corrected=corrected, added=added)
     return corrected, added
 
 
