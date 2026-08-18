@@ -844,8 +844,15 @@ async def on_guild_join(guild: discord.Guild) -> None:
     await _sync_guild_commands(guild)
 
 
+BACKFILL_ALLOWED_USER_ID = int(os.environ["BACKFILL_ALLOWED_USER_ID"])
+
+
+def _is_backfill_allowed(interaction: discord.Interaction) -> bool:
+    return interaction.user.id == BACKFILL_ALLOWED_USER_ID
+
+
 @bot.tree.command(name="backfill", description="Rescanne l'historique (et les fils) pour corriger/ajouter les combats manques")
-@app_commands.checks.has_permissions(administrator=True)
+@app_commands.check(_is_backfill_allowed)
 async def backfill_command(interaction: discord.Interaction):
     if _backfill_lock.locked():
         await interaction.response.send_message("Un backfill est deja en cours.", ephemeral=True)
@@ -866,8 +873,8 @@ async def backfill_command(interaction: discord.Interaction):
 
 @backfill_command.error
 async def backfill_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("Tu dois etre administrateur pour lancer un backfill.", ephemeral=True)
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("Tu n'es pas autorise a lancer un backfill.", ephemeral=True)
     else:
         raise error
 
